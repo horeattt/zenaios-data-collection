@@ -403,25 +403,68 @@
   .dash-id h2 { margin: 0; font-size: 26px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .dash-id p { margin: 2px 0 0; font-size: 13px; color: var(--text-2); }
   .vrow { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin: 10px 0; }
-  .vrow article {
+  .vrow article, .vital-card {
     border-radius: var(--radius-sm); padding: 10px 12px;
     border: 1px solid transparent;
+    text-align: left; width: 100%; cursor: pointer;
+    font: inherit; color: inherit; appearance: none;
+    min-height: 72px; touch-action: manipulation;
+    transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
   }
-  .vrow article:nth-child(1) { background: linear-gradient(180deg, #eef4ff, #e0eaff); border-color: #c9d8ff; } /* Tensiune — bleu */
-  .vrow article:nth-child(2) { background: linear-gradient(180deg, #eefaf4, #dcf3e8); border-color: #b7e4cf; } /* Frecvență — mentă */
-  .vrow article:nth-child(3) { background: linear-gradient(180deg, #f3f0ff, #e6e0ff); border-color: #cfc6ff; } /* Respirație — lavandă */
-  .vrow article:nth-child(4) { background: linear-gradient(180deg, #fff6eb, #ffedd6); border-color: #f5d7a8; } /* Temperatură — piersică */
-  .vrow article:nth-child(5) { background: linear-gradient(180deg, #eef9fc, #d9f1f7); border-color: #b5e0eb; } /* SpO2 — aqua */
-  .vrow span { font-size: 11px; color: var(--text-2); }
-  .vrow b { display: block; font-size: 20px; font-weight: 600; letter-spacing: -.02em; }
-  .vrow b.bad { color: var(--bad); }
+  .vital-card:hover, .vital-card:focus-visible { outline: none; transform: translateY(-1px); box-shadow: var(--shadow-sm); }
+  .vital-card:active { transform: scale(.98); }
+  .vital-card.open { box-shadow: 0 0 0 2px rgba(47, 91, 255, .28); }
+  .vrow article:nth-child(1), .vital-card:nth-child(1) { background: linear-gradient(180deg, #eef4ff, #e0eaff); border-color: #c9d8ff; }
+  .vrow article:nth-child(2), .vital-card:nth-child(2) { background: linear-gradient(180deg, #eefaf4, #dcf3e8); border-color: #b7e4cf; }
+  .vrow article:nth-child(3), .vital-card:nth-child(3) { background: linear-gradient(180deg, #f3f0ff, #e6e0ff); border-color: #cfc6ff; }
+  .vrow article:nth-child(4), .vital-card:nth-child(4) { background: linear-gradient(180deg, #fff6eb, #ffedd6); border-color: #f5d7a8; }
+  .vrow article:nth-child(5), .vital-card:nth-child(5) { background: linear-gradient(180deg, #eef9fc, #d9f1f7); border-color: #b5e0eb; }
+  .vrow span, .vital-card > span { font-size: 11px; color: var(--text-2); }
+  .vrow b, .vital-card > b { display: block; font-size: 20px; font-weight: 600; letter-spacing: -.02em; margin-top: 2px; }
+  .vrow b.bad, .vital-card > b.bad { color: var(--bad); }
+  .vital-card > em, .sum-card > em { display: block; margin-top: 6px; font-size: 10px; font-style: normal; color: var(--text-2); opacity: .85; }
   .dgrid { display: grid; grid-template-columns: 1.2fr .9fr .9fr; gap: 8px; }
-  .dgrid article { border-radius: var(--radius-sm); padding: 10px 12px; border: 1px solid transparent; }
-  .dgrid article:nth-child(1) { background: linear-gradient(180deg, #f0f4ff, #e4ebff); border-color: #c5d2ff; } /* Evoluție — periwinkle */
-  .dgrid article:nth-child(2) { background: linear-gradient(180deg, #f3fbf6, #e2f4ea); border-color: #b9dfc8; } /* Medicație — verde pal */
-  .dgrid article:nth-child(3) { background: linear-gradient(180deg, #fff5f7, #ffe8ee); border-color: #f5c5d0; } /* Investigații — roz pal */
-  .dgrid h3 { margin: 0 0 4px; font-size: 12px; color: var(--text-2); font-weight: 600; }
-  .dgrid p { margin: 0; font-size: 13px; }
+  .dgrid article, .sum-card {
+    border-radius: var(--radius-sm); padding: 10px 12px; border: 1px solid transparent;
+    text-align: left; width: 100%; cursor: pointer; font: inherit; color: inherit; appearance: none;
+    min-height: 88px; touch-action: manipulation;
+    transition: transform .15s ease, box-shadow .15s ease;
+  }
+  .sum-card:hover, .sum-card:focus-visible { outline: none; transform: translateY(-1px); box-shadow: var(--shadow-sm); }
+  .sum-card:active { transform: scale(.985); }
+  .sum-card.open { box-shadow: 0 0 0 2px rgba(47, 91, 255, .25); }
+  .dgrid article:nth-child(1), .sum-card:nth-child(1) { background: linear-gradient(180deg, #f0f4ff, #e4ebff); border-color: #c5d2ff; }
+  .dgrid article:nth-child(2), .sum-card:nth-child(2) { background: linear-gradient(180deg, #f3fbf6, #e2f4ea); border-color: #b9dfc8; }
+  .dgrid article:nth-child(3), .sum-card:nth-child(3) { background: linear-gradient(180deg, #fff5f7, #ffe8ee); border-color: #f5c5d0; }
+  .dgrid h3, .sum-card h3 { margin: 0 0 4px; font-size: 12px; color: var(--text-2); font-weight: 600; }
+  .dgrid p, .sum-card p { margin: 0; font-size: 13px; }
+  .vital-expand {
+    margin: 0 0 12px; padding: 12px 14px; border-radius: var(--radius-sm);
+    border: 1px solid #d5def8; background: linear-gradient(180deg, #fbfcff, #f3f6ff);
+    animation: vital-open .18s ease;
+  }
+  @keyframes vital-open { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+  .vital-expand-head { display: flex; gap: 12px; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; margin-bottom: 8px; }
+  .vital-expand-head h3 { margin: 0; font-size: 15px; }
+  .vital-expand .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .vital-expand .chip {
+    height: 30px; padding: 0 12px; border-radius: 999px; border: 1px solid var(--border);
+    background: #fff; font-size: 12px; font-weight: 600; color: var(--text-2); cursor: pointer;
+    touch-action: manipulation;
+  }
+  .vital-expand .chip.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .vital-svg { width: 100%; height: auto; display: block; max-height: 180px; }
+  .chart-tick { fill: var(--text-2); font-size: 10px; }
+  .chart-grid { stroke: #e6ebf5; stroke-width: 1; }
+  .vital-now { margin-top: 8px; font-size: 13px; }
+  .vital-now b { margin-right: 6px; color: var(--accent); }
+  .vital-table { margin-top: 10px; overflow: auto; }
+  .vital-table table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .vital-table th, .vital-table td { padding: 6px 8px; border-top: 1px solid var(--border); text-align: left; }
+  .vital-expand .legend { gap: 12px; }
+  .vital-expand .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
+  .vital-expand .swatch.sys { background: #2f5bff; }
+  .vital-expand .swatch.dia { background: #6aa6ff; }
   .legend { display: flex; gap: 16px; margin-top: 10px; font-size: 12px; color: var(--text-2); }
   .views { display: flex; width: fit-content; border: 1px solid var(--border); border-radius: 999px; overflow: hidden; margin-bottom: 12px; background: #fff; }
   .views button { border: 0; border-right: 1px solid var(--border); background: transparent; height: 32px; padding: 0 14px; font-size: 13px; font-weight: 600; color: var(--text-2); }

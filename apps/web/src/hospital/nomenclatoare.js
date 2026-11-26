@@ -14,7 +14,10 @@ export const NOMENCLATOR_CATALOG = [
   { id: "unitati_trimitatoare", label: "Unități trimitătoare", group: "Internare", cols: [["name", "Denumire"], ["type", "Tip"]] },
   { id: "alte_servicii", label: "Alte servicii", group: "Servicii", cols: [["name", "Denumire"], ["price", "Preț"], ["editable", "Pret modificabil"]] },
   { id: "proceduri", label: "Proceduri", group: "Clinic", cols: [["name", "Denumire"], ["code", "Cod"], ["group", "Grupă"]] },
-  { id: "grupe_dx_oms", label: "Grupe diagnostice OMS", group: "Clinic", cols: [["code", "Cod"], ["name", "Denumire"]] }
+  { id: "grupe_dx_oms", label: "Grupe diagnostice OMS", group: "Clinic", cols: [["code", "Cod"], ["name", "Denumire"]] },
+  { id: "icd10am", label: "ICD-10-AM (subset)", group: "Clinic", cols: [["code", "Cod"], ["name", "Denumire"]] },
+  { id: "achi", label: "ACHI proceduri (subset)", group: "Clinic", cols: [["code", "Cod"], ["name", "Denumire"]] },
+  { id: "dci_medicamente", label: "DCI medicamente (subset)", group: "Clinic", cols: [["dci", "DCI"], ["form", "Formă"], ["strength", "Concentrație"]] }
 ];
 
 function rows(list) {
@@ -42,6 +45,7 @@ export function seedNomenclatoare() {
       { name: "Salariat", code: "S" },
       { name: "Pensionar", code: "P" },
       { name: "Copil", code: "C" },
+      { name: "Student", code: "ST" },
       { name: "Fără ocupație", code: "F" }
     ]),
     tip_venire: rows([
@@ -55,7 +59,9 @@ export function seedNomenclatoare() {
       { name: "Nu necesită" },
       { name: "Criterii clinice" },
       { name: "Urgență medicală" },
-      { name: "Programare" }
+      { name: "Programare" },
+      { name: "Diagnostic" },
+      { name: "Tratament" }
     ]),
     tip_internare: rows([
       { name: "Continuă", dayCare: "nu" },
@@ -68,7 +74,8 @@ export function seedNomenclatoare() {
       { name: "Normal", code: "N" },
       { name: "Diabet", code: "D" },
       { name: "Hepatic", code: "H" },
-      { name: "Hiposodat", code: "HS" }
+      { name: "Hiposodat", code: "HS" },
+      { name: "Hidric", code: "HY" }
     ]),
     tip_act: rows([
       { name: "C.I.", code: "CI" },
@@ -103,6 +110,24 @@ export function seedNomenclatoare() {
       { code: "I00-I99", name: "Boli ale aparatului circulator" },
       { code: "J00-J99", name: "Boli ale aparatului respirator" },
       { code: "K00-K93", name: "Boli digestive" }
+    ]),
+    icd10am: rows([
+      { code: "I21.4", name: "Infarct miocardic acut subendocardic" },
+      { code: "I50.0", name: "Insuficiență cardiacă congestivă" },
+      { code: "J18.9", name: "Pneumonie, nespecificată" },
+      { code: "J44.1", name: "BPOC cu exacerbare acută" },
+      { code: "K35.8", name: "Apendicită acută" }
+    ]),
+    achi: rows([
+      { code: "92203-00", name: "ECG de repaus" },
+      { code: "55113-00", name: "Ecografie cardiacă" },
+      { code: "30520-00", name: "Apendicectomie" }
+    ]),
+    dci_medicamente: rows([
+      { dci: "Bisoprolol", form: "comprimate", strength: "5 mg" },
+      { dci: "Ceftriaxonă", form: "pulbere injectabilă", strength: "1 g" },
+      { dci: "Enoxaparină", form: "seringă preumplută", strength: "40 mg/0,4 ml" },
+      { dci: "Ser fiziologic", form: "soluție perfuzabilă", strength: "500 ml" }
     ])
   };
 }

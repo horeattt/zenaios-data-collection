@@ -64,7 +64,8 @@ describe("foaie clinică modulară", () => {
         lastName: "Ionescu",
         sex: "F",
         localKey: "ward:cardio:patient:demo-1",
-        diagnosis: "I21.4 Infarct"
+        diagnosis: "I21.4 Infarct",
+        pathway: "direct"
       }
     });
     expect(ensured.statusCode).toBe(200);
@@ -91,7 +92,8 @@ describe("foaie clinică modulară", () => {
         wardId: (ward.json() as { id: string }).id,
         firstName: "Maria",
         lastName: "Ionescu",
-        localKey: "ward:cardio:patient:demo-1"
+        localKey: "ward:cardio:patient:demo-1",
+        pathway: "direct"
       }
     });
     expect(again.json()).toMatchObject({ patientId: ids.patientId, reused: true });

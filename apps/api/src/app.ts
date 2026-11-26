@@ -841,9 +841,25 @@ export async function buildApp(db: Db, config: AppConfig): Promise<FastifyInstan
       birthDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
       localKey: z.string().min(1).max(80).optional(),
       diagnosis: z.string().max(240).optional(),
-      /** ambulator = internare programată/directă pe secție (nu UPU) */
-      pathway: z.enum(["ambulatory", "direct"]).default("ambulatory"),
-      cnp: z.string().regex(/^\d{13}$/).optional()
+      /** Obligatoriu — softul nu presupune ambulator. */
+      pathway: z.enum(["ambulatory", "direct", "upu"]),
+      cnp: z.string().regex(/^\d{13}$/).optional(),
+      admissionCriterion: z.string().max(120).optional(),
+      referralNumber: z.string().max(80).optional(),
+      insuranceCategory: z.string().max(120).optional(),
+      attendingPhysician: z.string().max(120).optional(),
+      allergies: z.string().max(400).optional(),
+      bloodGroup: z.string().max(40).optional(),
+      address: z.string().max(240).optional(),
+      phone: z.string().max(40).optional(),
+      kinName: z.string().max(120).optional(),
+      kinPhone: z.string().max(40).optional(),
+      bodyKg: z.number().positive().max(400).optional(),
+      heightCm: z.number().positive().max(300).optional(),
+      reason: z.string().max(2000).optional(),
+      antecedents: z.string().max(4000).optional(),
+      consentAdmit: z.boolean().optional(),
+      consentProc: z.boolean().optional()
     }).parse(request.body);
     await mustOwn(db, "wards", body.wardId, hospitalId);
     assertWardInScope(body.wardId, actor.wardScopeIds);
@@ -942,9 +958,13 @@ export async function buildApp(db: Db, config: AppConfig): Promise<FastifyInstan
         [encounterId, hospitalId, patientId]
       );
       await q.query(
-        `INSERT INTO admissions (id, hospital_id, encounter_id, patient_id, admitting_ward_id, current_ward_id, bed_id, started_at, status, file_no)
-         VALUES ($1, $2, $3, $4, $5, $5, $6, now(), 'active', $7)`,
-        [admissionId, hospitalId, encounterId, patientId, body.wardId, bedId, fileNo]
+        `INSERT INTO admissions (id, hospital_id, encounter_id, patient_id, admitting_ward_id, current_ward_id, bed_id, started_at, status, file_no, admission_criterion, referral_number, insurance_category, attending_physician, pathway)
+         VALUES ($1, $2, $3, $4, $5, $5, $6, now(), 'active', $7, $8, $9, $10, $11, $12)`,
+        [
+          admissionId, hospitalId, encounterId, patientId, body.wardId, bedId, fileNo,
+          body.admissionCriterion ?? null, body.referralNumber ?? null, body.insuranceCategory ?? null,
+          body.attendingPhysician ?? null, body.pathway
+        ]
       );
       if (body.diagnosis) {
         await q.query(
@@ -953,11 +973,55 @@ export async function buildApp(db: Db, config: AppConfig): Promise<FastifyInstan
           [newId(), hospitalId, patientId, encounterId, body.diagnosis, actor.id]
         );
       }
+      if (body.allergies && body.allergies.trim()) {
+        await q.query(
+          `INSERT INTO allergies (id, hospital_id, patient_id, substance, criticality, author_user_id)
+           VALUES ($1, $2, $3, $4, 'unable', $5)`,
+          [newId(), hospitalId, patientId, body.allergies.trim(), actor.id]
+        );
+      }
+      const pathwayText =
+        body.pathway === "upu" ? "Cale internare: UPU / urgență."
+          : body.pathway === "ambulatory" ? "Cale internare: ambulator / programat."
+            : "Cale internare: direct pe secție.";
       await q.query(
         `INSERT INTO clinical_notes (id, hospital_id, patient_id, encounter_id, kind, body, author_user_id)
          VALUES ($1, $2, $3, $4, 'admission_pathway', $5, $6)`,
-        [newId(), hospitalId, patientId, encounterId, `Cale internare: ${body.pathway === "ambulatory" ? "ambulator / programat" : "direct pe secție"}.`, actor.id]
+        [newId(), hospitalId, patientId, encounterId, pathwayText, actor.id]
       );
+      if (body.reason || body.antecedents || body.kinName || body.bloodGroup || body.address || body.phone) {
+        const meta = [
+          body.reason ? `Motiv: ${body.reason}` : "",
+          body.antecedents ? `Antecedente: ${body.antecedents}` : "",
+          body.kinName ? `Aparținător: ${body.kinName}${body.kinPhone ? ` (${body.kinPhone})` : ""}` : "",
+          body.bloodGroup ? `Grupa: ${body.bloodGroup}` : "",
+          body.address ? `Adresă: ${body.address}` : "",
+          body.phone ? `Telefon: ${body.phone}` : "",
+          body.bodyKg != null ? `Greutate: ${body.bodyKg} kg` : "",
+          body.heightCm != null ? `Înălțime: ${body.heightCm} cm` : ""
+        ].filter(Boolean).join("\n");
+        if (meta) {
+          await q.query(
+            `INSERT INTO clinical_notes (id, hospital_id, patient_id, encounter_id, kind, body, author_user_id)
+             VALUES ($1, $2, $3, $4, 'admission_data', $5, $6)`,
+            [newId(), hospitalId, patientId, encounterId, meta, actor.id]
+          );
+        }
+      }
+      if (body.consentAdmit === true || body.consentAdmit === false) {
+        await q.query(
+          `INSERT INTO consents (id, hospital_id, patient_id, purpose, status, recorded_by)
+           VALUES ($1, $2, $3, 'admission', $4, $5)`,
+          [newId(), hospitalId, patientId, body.consentAdmit ? "granted" : "refused", actor.id]
+        );
+      }
+      if (body.consentProc === true || body.consentProc === false) {
+        await q.query(
+          `INSERT INTO consents (id, hospital_id, patient_id, purpose, status, recorded_by)
+           VALUES ($1, $2, $3, 'procedure', $4, $5)`,
+          [newId(), hospitalId, patientId, body.consentProc ? "granted" : "refused", actor.id]
+        );
+      }
       await writeAudit(q, {
         hospitalId, actorUserId: actor.id, action: "chart_ensure", entityType: "admission", entityId: admissionId,
         summary: `Internare ${body.pathway} pe foaia clinică.`
@@ -1012,6 +1076,221 @@ export async function buildApp(db: Db, config: AppConfig): Promise<FastifyInstan
       await writeAudit(q, { hospitalId, actorUserId: actor.id, action: "discharge", entityType: "encounter", entityId: encounterId, summary: "Externare și scrisoare finală." });
       return { patientId: encounter.patient_id, documentId, code: "ok" };
     });
+  });
+
+  route("post", "/api/encounters/:id/vitals", "chart.write", async (request) => {
+    const actor = requireUser(request);
+    const hospitalId = requireHospital(request);
+    const encounterId = param(request, "id");
+    const body = z.object({
+      ta: z.string().min(1).max(20),
+      av: z.string().min(1).max(10),
+      rr: z.string().min(1).max(10),
+      temp: z.string().min(1).max(10),
+      spo2: z.string().min(1).max(10),
+      note: z.string().max(500).optional()
+    }).parse(request.body);
+    const encounter = await one<{ patient_id: string; status: string }>(
+      db, "SELECT patient_id, status FROM encounters WHERE id = $1 AND hospital_id = $2", [encounterId, hospitalId]
+    );
+    if (encounter.status !== "in_progress") fail(409, "Constantele se înregistrează doar pe o internare deschisă.");
+    const id = newId();
+    await db.query(
+      `INSERT INTO encounter_vitals (id, hospital_id, patient_id, encounter_id, ta, av, rr, temp, spo2, note, author_user_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+      [id, hospitalId, encounter.patient_id, encounterId, body.ta, body.av, body.rr, body.temp, body.spo2, body.note ?? null, actor.id]
+    );
+    return { id, patientId: encounter.patient_id };
+  });
+
+  route("post", "/api/medications/orders", "medication.write", async (request) => {
+    const actor = requireUser(request);
+    const hospitalId = requireHospital(request);
+    const body = z.object({
+      encounterId: z.string().uuid(),
+      medicationName: z.string().min(1).max(160),
+      dose: z.string().min(1).max(80),
+      route: z.string().max(40).optional(),
+      schedule: z.string().max(80).optional()
+    }).parse(request.body);
+    const encounter = await one<{ patient_id: string }>(
+      db, "SELECT patient_id FROM encounters WHERE id = $1 AND hospital_id = $2", [body.encounterId, hospitalId]
+    );
+    const id = newId();
+    await db.query(
+      `INSERT INTO medication_orders (id, hospital_id, patient_id, encounter_id, medication_name, dose, route, status, prescriber_user_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8)`,
+      [id, hospitalId, encounter.patient_id, body.encounterId, body.medicationName, body.dose, body.route ?? null, actor.id]
+    );
+    if (body.schedule) {
+      await db.query(
+        `INSERT INTO clinical_notes (id, hospital_id, patient_id, encounter_id, kind, body, author_user_id)
+         VALUES ($1, $2, $3, $4, 'medication', $5, $6)`,
+        [newId(), hospitalId, encounter.patient_id, body.encounterId, `Prescriere: ${body.medicationName} ${body.dose}${body.route ? ` · ${body.route}` : ""} · ${body.schedule}`, actor.id]
+      );
+    }
+    return { id, patientId: encounter.patient_id };
+  });
+
+  route("post", "/api/consents", "consent.write", async (request) => {
+    const actor = requireUser(request);
+    const hospitalId = requireHospital(request);
+    const body = z.object({
+      patientId: z.string().uuid(),
+      purpose: z.string().min(1).max(80),
+      status: z.enum(["granted", "refused", "withdrawn"])
+    }).parse(request.body);
+    await mustOwn(db, "patients", body.patientId, hospitalId);
+    const id = newId();
+    await db.query(
+      `INSERT INTO consents (id, hospital_id, patient_id, purpose, status, recorded_by)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [id, hospitalId, body.patientId, body.purpose, body.status, actor.id]
+    );
+    return { id };
+  });
+
+  route("get", "/api/wards/:id/physicians", "structure.read", async (request) => {
+    const hospitalId = requireHospital(request);
+    const wardId = param(request, "id");
+    await mustOwn(db, "wards", wardId, hospitalId);
+    const fromPractitioners = await db.query<{ id: string; first_name: string; last_name: string; specialty: string | null; parafa: string | null; grade: string | null; user_id: string | null }>(
+      `SELECT id, first_name, last_name, specialty, parafa, grade, user_id
+       FROM practitioners
+       WHERE hospital_id = $1 AND (ward_id = $2 OR ward_id IS NULL)
+       ORDER BY last_name, first_name`,
+      [hospitalId, wardId]
+    );
+    const fromEmployees = await db.query<{ id: string; first_name: string; last_name: string; job_title: string | null; user_id: string | null }>(
+      `SELECT id, first_name, last_name, job_title, user_id
+       FROM employees
+       WHERE hospital_id = $1 AND active = true AND ward_id = $2
+         AND (job_title ILIKE '%medic%' OR job_title ILIKE '%physician%' OR job_title ILIKE '%doctor%')
+       ORDER BY last_name, first_name`,
+      [hospitalId, wardId]
+    );
+    const fromUsers = await db.query<{ id: string; display_name: string; username: string }>(
+      `SELECT u.id, u.display_name, u.username
+       FROM users u
+       JOIN user_roles ur ON ur.user_id = u.id
+       JOIN roles r ON r.id = ur.role_id
+       LEFT JOIN user_ward_scopes s ON s.user_id = u.id
+       WHERE u.hospital_id = $1 AND r.code IN ('physician', 'ward_chief')
+         AND (s.ward_id IS NULL OR s.ward_id = $2)
+       ORDER BY u.display_name`,
+      [hospitalId, wardId]
+    );
+    const items = [
+      ...fromPractitioners.map((p) => ({
+        id: p.id,
+        name: `${p.last_name} ${p.first_name}`.trim(),
+        parafa: p.parafa || null,
+        grade: p.grade || null,
+        specialty: p.specialty || null,
+        userId: p.user_id,
+        source: "practitioner"
+      })),
+      ...fromEmployees.map((e) => ({
+        id: e.id,
+        name: `${e.last_name} ${e.first_name}`.trim(),
+        parafa: null,
+        grade: e.job_title || null,
+        specialty: null,
+        userId: e.user_id,
+        source: "employee"
+      })),
+      ...fromUsers.map((u) => ({
+        id: u.id,
+        name: u.display_name || u.username,
+        parafa: null,
+        grade: null,
+        specialty: null,
+        userId: u.id,
+        source: "user"
+      }))
+    ];
+    const seen = new Set<string>();
+    const unique = items.filter((item) => {
+      const key = item.name.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    return { items: unique };
+  });
+
+  route("get", "/api/hr/employees", "hr.read", async (request) => {
+    const hospitalId = requireHospital(request);
+    const q = request.query as { wardId?: string };
+    const rows = q.wardId
+      ? await db.query(
+        `SELECT id, ward_id, first_name, last_name, job_title, user_id, active
+         FROM employees WHERE hospital_id = $1 AND ward_id = $2 ORDER BY last_name, first_name`,
+        [hospitalId, q.wardId]
+      )
+      : await db.query(
+        `SELECT id, ward_id, first_name, last_name, job_title, user_id, active
+         FROM employees WHERE hospital_id = $1 ORDER BY last_name, first_name LIMIT 500`,
+        [hospitalId]
+      );
+    return { items: rows };
+  });
+
+  route("post", "/api/documents/generate", "chart.write", async (request) => {
+    const actor = requireUser(request);
+    const hospitalId = requireHospital(request);
+    const body = z.object({
+      encounterId: z.string().uuid(),
+      docType: z.enum(["discharge_letter", "focg", "observation_sheet"]),
+      title: z.string().min(1).max(160)
+    }).parse(request.body);
+    const encounter = await one<{ patient_id: string }>(
+      db, "SELECT patient_id FROM encounters WHERE id = $1 AND hospital_id = $2", [body.encounterId, hospitalId]
+    );
+    const hospital = await one<{ name: string; timezone: string; country_code: string }>(
+      db, "SELECT name, timezone, country_code FROM hospitals WHERE id = $1", [hospitalId]
+    );
+    const patient = await one<{ first_name: string; last_name: string; birth_date: string | null; sex: string | null }>(
+      db, "SELECT first_name, last_name, birth_date, sex FROM patients WHERE id = $1 AND hospital_id = $2", [encounter.patient_id, hospitalId]
+    );
+    const admission = await db.query<{ file_no: string | null; attending_physician: string | null; started_at: string }>(
+      `SELECT file_no, attending_physician, started_at FROM admissions
+       WHERE encounter_id = $1 AND hospital_id = $2 ORDER BY started_at DESC LIMIT 1`,
+      [body.encounterId, hospitalId]
+    );
+    const year = new Date().getFullYear();
+    const seqKey = body.docType === "discharge_letter" ? `sm_${year}` : `doc_${body.docType}_${year}`;
+    await db.query(
+      `INSERT INTO hospital_sequences (hospital_id, seq_key, last_value)
+       VALUES ($1, $2, 1)
+       ON CONFLICT (hospital_id, seq_key) DO UPDATE SET last_value = hospital_sequences.last_value + 1`,
+      [hospitalId, seqKey]
+    );
+    const seqRows = await db.query<{ last_value: number }>(
+      "SELECT last_value FROM hospital_sequences WHERE hospital_id = $1 AND seq_key = $2",
+      [hospitalId, seqKey]
+    );
+    const number = `${body.docType === "discharge_letter" ? "SM" : "DOC"}-${year}-${String(seqRows[0]?.last_value || 1).padStart(6, "0")}`;
+    const textBody = [
+      hospital.name,
+      `Cod țară: ${hospital.country_code || "—"}`,
+      `Document: ${body.title}`,
+      `Număr: ${number}`,
+      `FO: ${admission[0]?.file_no || "—"}`,
+      `Pacient: ${patient.last_name} ${patient.first_name}`,
+      `Sex: ${patient.sex || "—"} · Naștere: ${patient.birth_date || "—"}`,
+      `Medic curant: ${admission[0]?.attending_physician || actor.displayName}`,
+      `Emis: ${new Date().toISOString()}`,
+      "",
+      "Conținutul clinic este cel din baza spitalului la momentul generării. Softul nu completează automat rezultate."
+    ].join("\n");
+    const documentId = newId();
+    await db.query(
+      `INSERT INTO documents (id, hospital_id, patient_id, encounter_id, doc_type, status, version, title, body, source, author_user_id, finalized_at)
+       VALUES ($1, $2, $3, $4, $5, 'final', 1, $6, $7, 'server_generate', $8, now())`,
+      [documentId, hospitalId, encounter.patient_id, body.encounterId, body.docType, `${body.title} ${number}`, textBody, actor.id]
+    );
+    return { id: documentId, number, body: textBody, contentType: "text/plain; charset=utf-8" };
   });
 
   route("get", "/api/documents/:id", "chart.read", async (request) => {

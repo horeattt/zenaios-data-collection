@@ -1,10 +1,19 @@
 import { apiJson } from "./api.js";
 import { ensureSession } from "./session.js";
-import { hydrateBoardOccupancy as hydrateBoardMod, syncStructureToApi as syncStructureMod } from "./sync.js";
-import { ensureAndLoadChart, saveClinicalNote } from "./chart.js";
+import { hydrateBoardOccupancy as hydrateBoardMod, syncStructureToApi as syncStructureMod, loadStructureFromApi, resolveApiBedId } from "./sync.js";
+import {
+  ensureAndLoadChart, saveClinicalNote, saveClinicalVital, saveClinicalTransfer,
+  saveClinicalDischarge, saveClinicalMedication, saveClinicalConsent,
+  saveClinicalServiceRequest, loadWardPhysicians, requestDocumentPdf
+} from "./chart.js";
 import { NOMENCLATOR_CATALOG, seedNomenclatoare, nomOptions, catalogOf } from "./nomenclatoare.js";
 
 const KEY = "zena-spital-v5";
+/** Softul nu inventează date clinice. Seed demo doar cu ?demo=1 sau window.__ALLOW_DEMO_SEED__. */
+const ALLOW_DEMO_SEED = typeof window !== "undefined" && (
+  window.__ALLOW_DEMO_SEED__ === true ||
+  new URLSearchParams(window.location.search).get("demo") === "1"
+);
 var live = false;
 var apiMe = null;
 const KIT = [["Mănuși sterile", 1], ["Comprese sterile", 2]];
@@ -55,17 +64,127 @@ function ensureConfig() {
   }
   return dirty;
 }
+function roleTitle(role) {
+  if (role === "admin1") return "Admin 1 · spital";
+  if (role === "admin2") return "Admin 2 · departament";
+  return "User · departament";
+}
+function currentAccount() {
+  ensureAccess();
+  return (state.access.accounts || []).find(a => a.id === state.access.currentId) || null;
+}
+function isAdmin1() {
+  const a = currentAccount();
+  return !a || a.role === "admin1";
+}
+function isAdmin2() {
+  const a = currentAccount();
+  return !!(a && a.role === "admin2");
+}
+function isDeptUser() {
+  const a = currentAccount();
+  return !!(a && a.role === "user");
+}
+function accountDeptIds(account) {
+  return Array.isArray(account?.deptIds) ? account.deptIds : [];
+}
+function canManageDept(deptId) {
+  if (isAdmin1()) return true;
+  const a = currentAccount();
+  if (!a || a.role !== "admin2") return false;
+  return accountDeptIds(a).includes(deptId);
+}
+function canEditDeptFields(deptId) {
+  return canManageDept(deptId);
+}
+function visibleDepartments() {
+  const all = state.departments || [];
+  if (isAdmin1()) return all;
+  const a = currentAccount();
+  const ids = new Set(accountDeptIds(a));
+  return all.filter(d => ids.has(d.id));
+}
+function ensureAccess() {
+  let dirty = false;
+  if (!state.access || typeof state.access !== "object") {
+    state.access = { accounts: [], currentId: null };
+    dirty = true;
+  }
+  if (!Array.isArray(state.access.accounts)) {
+    state.access.accounts = [];
+    dirty = true;
+  }
+  if (!state.access.accounts.some(a => a.role === "admin1")) {
+    state.access.accounts.unshift({
+      id: uid(),
+      name: "Administrator spital",
+      username: "admin1",
+      role: "admin1",
+      deptIds: []
+    });
+    dirty = true;
+  }
+  (state.departments || []).forEach(dept => {
+    let admin2 = state.access.accounts.find(a => a.id === dept.admin2Id)
+      || state.access.accounts.find(a => a.role === "admin2" && accountDeptIds(a).includes(dept.id));
+    if (!admin2) {
+      admin2 = {
+        id: uid(),
+        name: dept.chief || ("Șef " + dept.name),
+        username: "admin2-" + deptCode(dept.name),
+        role: "admin2",
+        deptIds: [dept.id]
+      };
+      state.access.accounts.push(admin2);
+      dirty = true;
+    } else {
+      if (!accountDeptIds(admin2).includes(dept.id)) {
+        admin2.deptIds = [...accountDeptIds(admin2), dept.id];
+        dirty = true;
+      }
+      if (dept.chief && admin2.name !== dept.chief && admin2.name.startsWith("Șef ")) {
+        admin2.name = dept.chief;
+        dirty = true;
+      }
+    }
+    if (dept.admin2Id !== admin2.id) {
+      dept.admin2Id = admin2.id;
+      dirty = true;
+    }
+    const hasUser = state.access.accounts.some(a => a.role === "user" && accountDeptIds(a).includes(dept.id));
+    if (!hasUser) {
+      state.access.accounts.push({
+        id: uid(),
+        name: "Utilizator " + dept.name,
+        username: "user-" + deptCode(dept.name),
+        role: "user",
+        deptIds: [dept.id]
+      });
+      dirty = true;
+    }
+  });
+  if (!state.access.currentId || !state.access.accounts.some(a => a.id === state.access.currentId)) {
+    state.access.currentId = state.access.accounts.find(a => a.role === "admin1")?.id || state.access.accounts[0]?.id || null;
+    dirty = true;
+  }
+  return dirty;
+}
+function fieldKeyFromLabel(label) {
+  const base = String(label || "").toLowerCase().normalize("NFD").replace(/\p{M}/gu, "")
+    .replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "").slice(0, 32);
+  return base || ("camp_" + uid().slice(0, 5));
+}
 function icdCode(text) {
   const m = String(text || "").trim().match(/^([A-Z]\d{2}(?:\.\d{1,2})?)\b/i);
   return m ? m[1].toUpperCase() : "";
 }
 function routeFor(name, dose) {
   const blob = (String(name || "") + " " + String(dose || "")).toLowerCase();
-  if (/comprimate/.test(blob)) return "Oral";
+  if (/comprimate|cp\.|tb\.|tablete|capsule/.test(blob)) return "Oral";
   if (/subcut|enoxaparin/.test(blob)) return "Subcutanat";
   if (/inhal|salbutamol/.test(blob)) return "Inhalator";
   if (/ml|fiol|flacon|perfuz|sering|ui\//.test(blob)) return "Intravenos";
-  return "Oral";
+  return "";
 }
 function rhythmFor(name) {
   if (/enoxaparin|heparină|heparina|furosemid/i.test(name)) return "la 12 ore";
@@ -73,55 +192,16 @@ function rhythmFor(name) {
   if (/bisoprolol|atorva|ramipril|enalapril|digoxin|apixaban|pantoprazol/i.test(name)) return "la 24 ore";
   return "o dată";
 }
-function fillChart(wards) {
-  let dirty = false;
-  (wards || []).forEach(w => {
-    [...(w.patients || []), ...(w.discharged || [])].forEach(p => {
-      if (!p.dxAdmit) { p.dxAdmit = p.dx || ""; dirty = true; }
-      const code = icdCode(p.dx);
-      if (!icdCode(p.dxCode)) { p.dxCode = code; dirty = true; }
-      if (p.bodyKg == null) {
-        const n = fnv(p.cnp || p.id);
-        p.bodyKg = 52 + (n % 45);
-        p.heightCm = 155 + (n % 35);
-        dirty = true;
-      }
-      if (!p.kinName) {
-        const k = kinOf(p);
-        p.kinName = k.name;
-        p.kinWho = k.who;
-        p.kinPhone = k.phone;
-        dirty = true;
-      }
-      if (!p.antecedents) {
-        p.antecedents = antecedentsOf(p).filter(x => !/^Alergie/.test(x)).join(". ") + ".";
-        dirty = true;
-      }
-      if (!p.reason) {
-        p.reason = "Internare " + String(p.type || "de urgență").toLowerCase() + " pentru " + (p.dx || "evaluare") + ".";
-        dirty = true;
-      }
-      if (!p.referrer) {
-        p.referrer = p.type === "Programată" ? "Medic de familie" : "Ambulanță";
-        dirty = true;
-      }
-      if (p.consentAdmit == null) { p.consentAdmit = true; p.consentProc = !!(w && (w.focus === "surg" || w.id === "chir")); dirty = true; }
-      (p.vitals || []).forEach(v => {
-        if (v.rr == null) { v.rr = /dispnee|bradicard|șoc|soc/i.test(v.note || "") ? "28" : "16"; dirty = true; }
-      });
-      (p.meds || []).forEach(m => {
-        if (!m.route) { m.route = routeFor(m.name, m.dose); m.schedule = rhythmFor(m.name); m.by = m.by || p.physician || ""; dirty = true; }
-      });
-    });
-  });
-  return dirty;
+/** Softul nu inventează date clinice. Completările se fac doar din ce a scris medicul. */
+function fillChart(_wards) {
+  return false;
 }
-const seeded = fillArchive(state.wards);
-const profiles = fillProfiles(state.wards);
+const seeded = ALLOW_DEMO_SEED ? fillArchive(state.wards) : false;
+const profiles = false;
 const groups = fillSupplyGroups(state.wards);
-const chart = fillChart(state.wards);
-if (seeded || profiles || groups || ensureConfig() || chart) persist();
-let ui = { page: "home", wardId: null, patientId: null, tab: "sumar", filter: "all", query: "", bed: null, draft: null, view: "paturi", gest: "materiale", medQuery: "", magQuery: "", magClass: "", studyQuery: "", studyKind: "analize", drill: null, period: "azi", staffCat: "medici", deptId: null, labGroup: "uzuale", holdMed: null, doctor: null, compose: false, sheetPage: 0, calOpen: false, calMonth: "", rangeFrom: "", rangeTo: "", zenaOpen: false, zenaThread: [], zenaDraft: "", aiHeard: "", aiReply: "", aiDemo: 0, letterDraft: null, supClass: "Toate", imgKind: "", histOpen: false, histQuery: "", histDoc: "", openAlerts: [], adminIn: true, wardScopeIds: null, hospitalWideAccess: true, apiBoardTotal: 0, platformNote: "", adminTab: "ops", pilotCache: null, flowKind: "patient", wardMenuOpen: false, apptDay: "", apptPractitioner: "", admitStep: 0, admitDraft: null };
+const chart = false;
+if (seeded || profiles || groups || ensureConfig() || ensureAccess() || chart) persist();
+let ui = { page: "home", wardId: null, patientId: null, tab: "sumar", filter: "all", query: "", bed: null, draft: null, view: "paturi", gest: "materiale", medQuery: "", magQuery: "", magClass: "", studyQuery: "", studyKind: "analize", drill: null, period: "azi", staffCat: "medici", deptId: null, labGroup: "uzuale", holdMed: null, doctor: null, compose: false, sheetPage: 0, calOpen: false, calMonth: "", rangeFrom: "", rangeTo: "", zenaOpen: false, zenaThread: [], zenaDraft: "", aiHeard: "", aiReply: "", aiDemo: 0, letterDraft: null, supClass: "Toate", imgKind: "", histOpen: false, histQuery: "", histDoc: "", openAlerts: [], adminIn: true, wardScopeIds: null, hospitalWideAccess: true, apiBoardTotal: 0, platformNote: "", adminTab: "ops", pilotCache: null, flowKind: "patient", wardMenuOpen: false, apptDay: "", apptPractitioner: "", admitStep: 0, admitDraft: null, vitalExpand: null, vitalRange: "ore" };
 let toastTimer;
 let micTimer;
 
@@ -145,6 +225,8 @@ function collectionSnapshot() {
     nomenclatoare: state.nomenclatoare || seedNomenclatoare(),
     hospital: state.hospital,
     integrations: state.integrations,
+    access: state.access || { accounts: [], currentId: null },
+    moduleConfigs: state.moduleConfigs || {},
     synthetic: state.synthetic !== false,
     expectedVersion: state.collectionVersion || undefined
   };
@@ -181,7 +263,10 @@ function applyCollection(doc) {
   state.nomenclatoare = doc.nomenclatoare || state.nomenclatoare || seedNomenclatoare();
   if (doc.hospital) state.hospital = doc.hospital;
   if (doc.integrations) state.integrations = doc.integrations;
+  if (doc.access) state.access = doc.access;
+  if (doc.moduleConfigs) state.moduleConfigs = doc.moduleConfigs;
   state.synthetic = doc.synthetic !== false;
+  ensureAccess();
 }
 function noms() {
   if (!state.nomenclatoare) state.nomenclatoare = seedNomenclatoare();
@@ -206,10 +291,10 @@ function showLiveBar(text) {
 function uid() { return Math.random().toString(36).slice(2, 10); }
 function pad(n) { return String(n).padStart(2, "0"); }
 function todayKey() { const d = new Date(); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`; }
-function stamp(daysAgo, hour) {
+function stamp(daysAgo, hour, minute) {
   const d = new Date();
   d.setDate(d.getDate() - daysAgo);
-  d.setHours(hour, (daysAgo * 7) % 50, 0, 0);
+  d.setHours(hour, minute == null ? ((daysAgo * 7) % 50) : minute, 0, 0);
   return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 function nowStamp() { const d = new Date(); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`; }
@@ -257,8 +342,52 @@ function vitalToday(p) { return (p.vitals || []).some(v => onDay(v.at)); }
 function roleLabel(role) { return { medic: "Medic", asistenta: "Asistentă", infirmiera: "Infirmieră", brancardier: "Brancardier" }[role] || role; }
 function dutyLabel(role) { return { medic: "Medic de gardă", asistenta: "Asistentă de gardă", infirmiera: "Infirmieră", brancardier: "Brancardier" }[role] || role; }
 function medics(w) {
+  const apiNames = (w.apiPhysicians || []).map(p => p.name).filter(Boolean);
+  if (apiNames.length) return apiNames;
   const from = (w.staff || []).filter(s => s.role === "medic").map(s => s.name);
-  return from.length ? from : (w.physicians || [w.chief]);
+  if (from.length) return from;
+  const local = (w.physicians || []).filter(Boolean);
+  return local.length ? local : (w.chief ? [w.chief] : []);
+}
+async function refreshWardPhysicians(w) {
+  if (!live || !w?.apiId) return;
+  try {
+    const items = await loadWardPhysicians(w.apiId);
+    w.apiPhysicians = items;
+    if (items.length) {
+      w.physicians = items.map(p => p.name);
+      const medStaff = items.map(p => ({ id: p.id || uid(), name: p.name, role: "medic", parafa: p.parafa || "", grade: p.grade || "" }));
+      const other = (w.staff || []).filter(s => s.role !== "medic");
+      w.staff = other.concat(medStaff);
+    }
+  } catch (_err) { /* lista rămâne cea locală */ }
+}
+async function commitAdmitClinical(w, p, bed) {
+  if (!live) {
+    p.fileNo = p.fileNo || nextFileNo(w);
+    persist();
+    return;
+  }
+  if (!w.apiId) throw new Error("Secția nu este în domeniul clinic (lipsește apiId). Sincronizați structura din bază, fără a crea secții noi.");
+  const bedId = resolveApiBedId(w, bed);
+  if (!bedId) throw new Error("Patul selectat nu are id clinic. Reîncărcați structura din bază.");
+  const { ensured } = await ensureAndLoadChart(w, p, { bedId, pathway: p.pathway || "direct" });
+  p.fileNo = ensured.fileNo || p.fileNo;
+  if (p.consentAdmit === true || p.consentAdmit === false) {
+    try { await saveClinicalConsent(p, "admission", !!p.consentAdmit); } catch (_e) { /* deja din ensure */ }
+  }
+  if (p.consentProc === true || p.consentProc === false) {
+    try { await saveClinicalConsent(p, "procedure", !!p.consentProc); } catch (_e) { /* deja din ensure */ }
+  }
+  persist();
+}
+async function postStudyResult(p, study) {
+  if (!live || !p?.clinical?.encounterId) return;
+  if (study.kind === "analize") {
+    await saveClinicalServiceRequest(p, study.code || "lab", study.title || "Analize");
+  } else {
+    await saveClinicalServiceRequest(p, study.kind || "imaging", study.title || study.kind);
+  }
 }
 function lowStock(w) { return (w.stock || []).filter(s => s.qty < s.min); }
 function kitGap(w) {
@@ -370,13 +499,33 @@ function buildVitals(i, critic) {
   const rows = [
     { ta: "136/80", av: "86", temp: "36,7", spo2: "97", rr: "16", note: "" },
     { ta: "130/78", av: "82", temp: "36,6", spo2: "98", rr: "16", note: "" },
-    { ta: "126/74", av: "78", temp: "36,5", spo2: "98", rr: "15", note: "" }
+    { ta: "126/74", av: "78", temp: "36,5", spo2: "98", rr: "15", note: "" },
+    { ta: "124/72", av: "76", temp: "36,6", spo2: "98", rr: "16", note: "" },
+    { ta: "128/76", av: "80", temp: "36,7", spo2: "97", rr: "17", note: "" }
   ];
-  rows.push(critic
-    ? { ta: "96/58", av: "118", temp: "37,8", spo2: "91", rr: "28", note: "Dispnee, supraveghere apropiată" }
-    : { ta: "122/72", av: "74", temp: "36,6", spo2: "98", rr: "16", note: "" });
-  const list = rows.map((v, idx) => ({ ...v, at: stamp(rows.length - 1 - idx, 7 + idx) }));
-  if (i % 3 === 2 && !critic) list[list.length - 1].at = stamp(1, 18);
+  if (critic) {
+    rows.push(
+      { ta: "110/68", av: "96", temp: "37,2", spo2: "94", rr: "22", note: "Agravare progresivă" },
+      { ta: "98/60", av: "108", temp: "37,5", spo2: "92", rr: "26", note: "Supraveghere intensivă" },
+      { ta: "96/58", av: "118", temp: "37,8", spo2: "91", rr: "28", note: "Dispnee, supraveghere apropiată" },
+      { ta: "80/60", av: "40", temp: "37,8", spo2: "91", rr: "28", note: "Hipotensiune și bradicardie" }
+    );
+  } else {
+    rows.push({ ta: "122/72", av: "74", temp: "36,6", spo2: "98", rr: "16", note: "" });
+  }
+  const list = rows.map((v, idx) => {
+    const ago = rows.length - 1 - idx;
+    const hour = critic && ago <= 2 ? 8 + ago * 2 : 7 + (idx % 5);
+    return { ...v, at: stamp(Math.min(ago, 6), hour) };
+  });
+  if (critic) {
+    const last = list[list.length - 1];
+    last.at = stamp(0, 10);
+    list.push({ ta: "82/58", av: "44", temp: "37,7", spo2: "90", rr: "27", note: "Control la 30 min", at: stamp(0, 10, 30) });
+    list.push({ ta: "80/60", av: "40", temp: "37,8", spo2: "91", rr: "28", note: "Acum", at: stamp(0, 11, 0) });
+  } else if (i % 3 === 2) {
+    list[list.length - 1].at = stamp(1, 18);
+  }
   return list;
 }
 function buildSupplies(i) {
@@ -452,20 +601,8 @@ function profileFor(i) {
   const n = Math.abs(Number(i) || 0);
   return { blood: bloods[n % bloods.length], address: streets[n % streets.length] + " " + (8 + (n % 36)) + ", " + towns[n % towns.length] };
 }
-function fillProfiles(wards) {
-  let added = false;
-  (wards || []).forEach(w => {
-    [...(w.patients || []), ...(w.discharged || [])].forEach(p => {
-      if (p.blood && p.address) return;
-      let n = 0;
-      for (const ch of String(p.cnp || p.id || "0")) n += ch.charCodeAt(0);
-      const prof = profileFor(n);
-      if (!p.blood) p.blood = prof.blood;
-      if (!p.address) p.address = prof.address;
-      added = true;
-    });
-  });
-  return added;
+function fillProfiles(_wards) {
+  return false;
 }
 function makeArchive(spec, i, outcome, group) {
   const p = makePatient(spec, i, "out");
@@ -479,6 +616,7 @@ function makeArchive(spec, i, outcome, group) {
   return p;
 }
 function fillArchive(wards) {
+  if (!ALLOW_DEMO_SEED) return false;
   let added = false;
   (wards || []).forEach(w => {
     if ((w.discharged || []).some(p => p.archive)) return;
@@ -553,11 +691,11 @@ function seedWards() {
     return {
       id: spec.id, name: spec.name, chief: spec.chief, nurse: spec.nurse, physicians: spec.physicians, focus: spec.focus,
       staff, duty: defaultDuty(staff), stock: defaultStock(idx), meds: defaultMeds(), bedCount: BEDS, closed: [],
-      patients: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15].map(i => makePatient(spec, i, "in")),
-      discharged: [20, 21, 22].map(i => makePatient(spec, i, "out"))
+      patients: ALLOW_DEMO_SEED ? [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15].map(i => makePatient(spec, i, "in")) : [],
+      discharged: ALLOW_DEMO_SEED ? [20, 21, 22].map(i => makePatient(spec, i, "out")) : []
     };
   });
-  armSafety(wards);
+  if (ALLOW_DEMO_SEED) armSafety(wards);
   return wards;
 }
 function giveSeedMed(w, p, name) {
@@ -762,11 +900,13 @@ function localPat(bedNo) { return ((bedNo - 1) % 4) + 1; }
 function studyLine(s) {
   if (s.status !== "finalizat") return s.title + " — în lucru";
   if (s.kind === "analize") {
-    const abn = (s.rows || []).filter(r => r.flag);
-    if (!abn.length) return s.title + " — valori în intervalul de referință";
-    return s.title + " — " + abn.map(r => `${r.name} ${r.value} ${r.unit}`).join("; ");
+    const rows = (s.rows || []).filter(r => r.value != null && String(r.value).trim() !== "");
+    if (!rows.length) return s.title + " — fără rezultat";
+    const abn = rows.filter(r => r.flag);
+    if (abn.length) return s.title + " — " + abn.map(r => `${r.name} ${r.value}${r.unit ? " " + r.unit : ""}`).join("; ");
+    return s.title + " — " + rows.map(r => `${r.name} ${r.value}${r.unit ? " " + r.unit : ""}`).join("; ");
   }
-  return s.title + " — " + s.result;
+  return s.title + " — " + (s.result || "fără rezultat");
 }
 function kindLabel(k) { return { analize: "Analize", rx: "RX", ct: "CT", rmn: "RMN", echo: "Ecografie" }[k] || k; }
 
@@ -848,32 +988,30 @@ function seedGestTypes() {
   ];
 }
 function navHtml() {
+  const acc = currentAccount();
   const item = (act, id, label, ico, on) => `<button class="nav-item${on ? " active" : ""}" type="button" data-act="${act}" data-id="${esc(id || "")}">${icon(ico)}${esc(label)}</button>`;
-  const head = (label, act, tip) => `<div class="nav-label">${label}<button class="nav-plus" type="button" data-act="${act}" title="${esc(tip)}">+</button></div>`;
-  const wards = visibleWards().map(w => item("ward", w.id, w.name, "i-bed", false)).join("");
-  const gest = (state.gestTypes || []).map(t => item("gest", t.id, t.name, "i-file", ui.page === "gest" && ui.gest === t.id)).join("");
-  const people = Object.entries(staffSpec()).map(([id, meta]) => item("people", id, meta.label, "i-file", ui.page === "people" && ui.staffCat === id)).join("");
-  const depts = (state.departments || []).map(d => item("dept", d.id, d.name, "i-grid", ui.page === "dept" && ui.deptId === d.id)).join("");
+  const head = (label, act, tip) => `<div class="nav-label">${label}${isAdmin1() ? `<button class="nav-plus" type="button" data-act="${act}" title="${esc(tip)}">+</button>` : ""}</div>`;
+  const wards = isDeptUser() ? "" : visibleWards().map(w => item("ward", w.id, w.name, "i-bed", false)).join("");
+  const gest = isAdmin1() ? (state.gestTypes || []).map(t => item("gest", t.id, t.name, "i-file", ui.page === "gest" && ui.gest === t.id)).join("") : "";
+  const people = isAdmin1() ? Object.entries(staffSpec()).map(([id, meta]) => item("people", id, meta.label, "i-file", ui.page === "people" && ui.staffCat === id)).join("") : "";
+  const depts = visibleDepartments().map(d => item("dept", d.id, d.name, "i-grid", ui.page === "dept" && ui.deptId === d.id)).join("");
+  const showStructure = isAdmin1() || isAdmin2();
   return `
-    <button class="brand" type="button" data-act="home"><div class="mark">Z</div><div><b>Administrare</b><span>Panou spital</span></div></button>
+    <button class="brand" type="button" data-act="home"><div class="mark">Z</div><div><b>Administrare</b><span>${esc(roleTitle(acc?.role || "admin1"))}</span></div></button>
     <div class="nav-scroll">
-      <button class="nav-item zena-entry${ui.page === "ai-zena" ? " active" : ""}" type="button" data-act="ai-zena">${icon("i-mic")}AI Zena</button>
-      ${head("Secții", "setup", "Adaugă sau configurează o secție")}
-      ${wards}
-      ${head("Gestiune", "gest-new", "Adaugă un tip de gestiune")}
-      ${gest}
-      <div class="nav-label">Personal</div>
-      ${people}
-      ${head("Departamente", "dept-new", "Adaugă un departament")}
-      ${depts}
+      ${isAdmin1() ? `<button class="nav-item zena-entry${ui.page === "ai-zena" ? " active" : ""}" type="button" data-act="ai-zena">${icon("i-mic")}AI Zena</button>` : ""}
+      ${isAdmin1() ? `${head("Secții", "setup", "Adaugă sau configurează o secție")}${wards}` : ""}
+      ${isAdmin1() ? `${head("Gestiune", "gest-new", "Adaugă un tip de gestiune")}${gest}` : ""}
+      ${isAdmin1() ? `<div class="nav-label">Personal</div>${people}` : ""}
+      ${showStructure ? `${head("Departamente", "dept-new", "Adaugă un departament")}${depts}` : `<div class="nav-label">Departamentul meu</div>${depts}`}
     </div>
     <div class="sidebar-foot">
-      <button class="user user-btn${ui.page === "admin" ? " on" : ""}" type="button" data-act="admin" title="Configurare spital"><div class="avatar">${esc((ui.accountName || "DH").slice(0, 2).toUpperCase())}</div><div><b>${esc(ui.accountName || "Dr. Horea")}</b><span>${esc(ui.accountRole || "Administrator")}</span></div></button>
-      <button class="linkish" type="button" data-act="ops-sync">Sincronizează structura</button>
+      <button class="user user-btn${ui.page === "admin" ? " on" : ""}" type="button" data-act="admin" title="Configurare spital"><div class="avatar">${esc((acc?.name || ui.accountName || "DH").slice(0, 2).toUpperCase())}</div><div><b>${esc(acc?.name || ui.accountName || "Dr. Horea")}</b><span>${esc(roleTitle(acc?.role || ui.accountRole || "admin1"))}</span></div></button>
+      ${isAdmin1() ? `<button class="linkish" type="button" data-act="ops-sync">Sincronizează structura</button>
       <button class="linkish" type="button" data-act="ops-lis">Trimite LIS</button>
       <button class="linkish" type="button" data-act="ops-backup">Copie de rezervă</button>
       <a class="linkish" href="/panou.html">Panou tehnic</a>
-      <button class="linkish" type="button" data-act="reset">Resetează demonstrația</button>
+      <button class="linkish" type="button" data-act="reset">Resetează demonstrația</button>` : `<button class="linkish" type="button" data-act="admin">Admin departament</button>`}
     </div>`;
 }
 
@@ -1158,7 +1296,7 @@ function pageWard() {
     return topHtml(w.name, "Programări Ambulatoriu · HL7 SIU", clinicActions(), back) + `<div class="content">${appointmentsHtml({ wardId: w.apiId, wardName: w.name, admin: false })}</div>`;
   }
   if (view === "garzi") {
-    return topHtml(w.name, "Gărzi și pontaj", clinicActions(), back) + `<div class="content">${wardDutyHtml(w)}</div>`;
+    return topHtml(w.name, "Gărzi, pontaj și personal", clinicActions(), back) + `<div class="content">${wardDutyHtml(w)}${gardaHtml(w)}</div>`;
   }
   if (view === "lab") {
     return topHtml(w.name, "Laborator pe secție", clinicActions(), back) + `<div class="content">${wardLabHtml(w)}</div>`;
@@ -1563,7 +1701,188 @@ function bannerHtml(w, p) {
   const place = p.bed ? `Pat ${pad(p.bed)} · ziua ${stayDays(p.admitted)}` : `Externat ${fmtDay(p.discharged)}`;
   return `<div class="banner"><div style="flex:1"><div class="muted">${esc(p.fileNo)} · ${esc(w.name)}</div><h2>${esc(p.last)} ${esc(p.first)}</h2><p>${ageOf(p.birth)} ani · ${sexLabel(p.sex)} · ${place} · ${esc(p.physician)}</p><p>${esc(p.dx)}</p>${allergy}</div><div>${badge(p.status)}</div></div>`;
 }
-function latestVital(p) { return p.vitals[p.vitals.length - 1]; }
+function latestVital(p) { return (p.vitals || [])[(p.vitals || []).length - 1]; }
+function parseTa(ta) {
+  const m = String(ta || "").match(/(\d+)\s*\/\s*(\d+)/);
+  return m ? { sys: Number(m[1]), dia: Number(m[2]) } : null;
+}
+function tempNum(v) { return Number(String(v || "").replace(",", ".")); }
+function vitalMetricDefs() {
+  return {
+    ta: { label: "Tensiune", unit: "mmHg", ranges: [["minute", "Minute"], ["ore", "Ore"], ["zile", "Zile"]] },
+    av: { label: "Frecvență", unit: "/min", ranges: [["minute", "Minute"], ["ore", "Ore"], ["zile", "Zile"]] },
+    rr: { label: "Respirație", unit: "/min", ranges: [["minute", "Minute"], ["ore", "Ore"], ["zile", "Zile"]] },
+    temp: { label: "Temperatură", unit: "°C", ranges: [["ore", "Ore"], ["zile", "Zile"]] },
+    spo2: { label: "SpO₂", unit: "%", ranges: [["minute", "Minute"], ["ore", "Ore"], ["zile", "Zile"]] },
+    evo: { label: "Ultima evoluție", unit: "", ranges: [["zile", "Zile"]] },
+    meds: { label: "Medicație", unit: "", ranges: [["zile", "Zile"]] },
+    studies: { label: "Investigații", unit: "", ranges: [["zile", "Zile"]] }
+  };
+}
+function vitalRawSeries(p, metric) {
+  const list = (p.vitals || []).slice().sort((a, b) => String(a.at).localeCompare(String(b.at)));
+  if (metric === "ta") {
+    return list.flatMap(v => {
+      const t = parseTa(v.ta);
+      if (!t) return [];
+      return [
+        { at: v.at, value: t.sys, series: "sys", label: v.ta, note: v.note },
+        { at: v.at, value: t.dia, series: "dia", label: v.ta, note: v.note }
+      ];
+    });
+  }
+  return list.map(v => {
+    let value = null;
+    if (metric === "av") value = Number(v.av);
+    else if (metric === "rr") value = Number(v.rr);
+    else if (metric === "temp") value = tempNum(v.temp);
+    else if (metric === "spo2") value = Number(v.spo2);
+    if (value == null || Number.isNaN(value)) return null;
+    return { at: v.at, value, series: "main", label: String(metric === "temp" ? v.temp : value), note: v.note };
+  }).filter(Boolean);
+}
+function densifySeries(points, range) {
+  if (!points.length) return [];
+  const bySeries = {};
+  points.forEach(pt => {
+    bySeries[pt.series || "main"] = bySeries[pt.series || "main"] || [];
+    bySeries[pt.series || "main"].push(pt);
+  });
+  const out = [];
+  Object.keys(bySeries).forEach(series => {
+    const src = bySeries[series].slice().sort((a, b) => String(a.at).localeCompare(String(b.at)));
+    if (range === "zile" || src.length < 2) {
+      src.forEach(p => out.push(p));
+      return;
+    }
+    const stepMin = range === "minute" ? 5 : 30;
+    for (let i = 0; i < src.length - 1; i++) {
+      const a = src[i], b = src[i + 1];
+      const t0 = new Date(a.at).getTime(), t1 = new Date(b.at).getTime();
+      out.push(a);
+      if (!(t1 > t0)) continue;
+      const steps = Math.min(24, Math.floor((t1 - t0) / (stepMin * 60000)));
+      for (let s = 1; s < steps; s++) {
+        const ratio = s / steps;
+        const t = new Date(t0 + (t1 - t0) * ratio);
+        const iso = `${t.getFullYear()}-${pad(t.getMonth() + 1)}-${pad(t.getDate())}T${pad(t.getHours())}:${pad(t.getMinutes())}`;
+        const value = a.value + (b.value - a.value) * ratio;
+        out.push({ at: iso, value: Math.round(value * 10) / 10, series, label: String(Math.round(value)), note: "", synthetic: true });
+      }
+    }
+    out.push(src[src.length - 1]);
+  });
+  return out.sort((a, b) => String(a.at).localeCompare(String(b.at)));
+}
+function filterSeriesRange(points, range) {
+  if (!points.length) return [];
+  const now = Date.now();
+  const ms = range === "minute" ? 3 * 3600000 : range === "ore" ? 24 * 3600000 : 14 * 86400000;
+  const cut = now - ms;
+  const filtered = points.filter(p => new Date(p.at).getTime() >= cut);
+  return filtered.length >= 2 ? filtered : points.slice(-Math.min(points.length, range === "zile" ? 12 : 8));
+}
+function svgVitalChart(points, opts = {}) {
+  const W = 560, H = 160, padL = 36, padR = 12, padT = 14, padB = 28;
+  if (!points.length) return `<div class="muted">Nu există valori în istoric.</div>`;
+  const seriesIds = [...new Set(points.map(p => p.series || "main"))];
+  const values = points.map(p => p.value);
+  let min = Math.min(...values), max = Math.max(...values);
+  if (min === max) { min -= 1; max += 1; }
+  const span = max - min || 1;
+  const times = points.map(p => new Date(p.at).getTime());
+  const t0 = Math.min(...times), t1 = Math.max(...times);
+  const tspan = Math.max(1, t1 - t0);
+  const xOf = t => padL + ((t - t0) / tspan) * (W - padL - padR);
+  const yOf = v => padT + (1 - (v - min) / span) * (H - padT - padB);
+  const colors = { main: "#2f5bff", sys: "#2f5bff", dia: "#6aa6ff", evo: "#5b6cff", meds: "#2f9e6f", studies: "#c45b74" };
+  const paths = seriesIds.map(id => {
+    const pts = points.filter(p => (p.series || "main") === id);
+    const d = pts.map((p, i) => `${i ? "L" : "M"}${xOf(new Date(p.at).getTime()).toFixed(1)} ${yOf(p.value).toFixed(1)}`).join(" ");
+    return `<path d="${d}" fill="none" stroke="${colors[id] || colors.main}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>` +
+      pts.filter(p => !p.synthetic).map(p => `<circle cx="${xOf(new Date(p.at).getTime()).toFixed(1)}" cy="${yOf(p.value).toFixed(1)}" r="3.2" fill="${colors[id] || colors.main}"/>`).join("");
+  }).join("");
+  const last = points.filter(p => !p.synthetic).slice(-1)[0] || points[points.length - 1];
+  const yTicks = [min, min + span / 2, max].map(v => {
+    const y = yOf(v);
+    return `<text x="4" y="${y + 3}" class="chart-tick">${esc(String(Math.round(v * 10) / 10))}</text><line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" class="chart-grid"/>`;
+  }).join("");
+  const xLabels = [points[0], points[Math.floor(points.length / 2)], points[points.length - 1]].filter(Boolean).map(p => {
+    const d = new Date(p.at);
+    const label = opts.range === "zile"
+      ? d.toLocaleDateString("ro-RO", { day: "2-digit", month: "short" })
+      : d.toLocaleTimeString("ro-RO", { hour: "2-digit", minute: "2-digit" });
+    return `<text x="${xOf(d.getTime()).toFixed(1)}" y="${H - 6}" text-anchor="middle" class="chart-tick">${esc(label)}</text>`;
+  }).join("");
+  return `<svg class="vital-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(opts.label || "Grafic")}">${yTicks}${paths}${xLabels}</svg>
+    <div class="vital-now"><b>Acum</b> ${esc(last.label || String(last.value))}${opts.unit ? " " + esc(opts.unit) : ""} · ${esc(fmt(last.at))}${last.note ? " · " + esc(last.note) : ""}</div>`;
+}
+function eventSeries(p, metric) {
+  if (metric === "evo") {
+    return (p.notes || []).map(n => ({ at: n.at, value: Math.min(5, Math.max(1, String(n.text || "").split(/\s+/).length / 8)), series: "evo", label: n.text, note: n.author }));
+  }
+  if (metric === "meds") {
+    return (p.meds || []).map((m, i) => ({ at: m.at, value: 1 + (i % 3), series: "meds", label: `${m.name} ${m.dose}`, note: m.schedule || "" }));
+  }
+  return (p.studies || []).map((s, i) => ({ at: s.at, value: s.status === "finalizat" ? 3 : 1.5, series: "studies", label: s.title, note: s.status }));
+}
+function vitalExpandHtml(p, metric) {
+  const def = vitalMetricDefs()[metric];
+  if (!def) return "";
+  const range = (def.ranges.some(([id]) => id === ui.vitalRange) ? ui.vitalRange : def.ranges[0][0]);
+  ui.vitalRange = range;
+  const raw = ["evo", "meds", "studies"].includes(metric) ? eventSeries(p, metric) : vitalRawSeries(p, metric);
+  const densified = densifySeries(raw, range);
+  const series = filterSeriesRange(densified, range);
+  const chips = def.ranges.map(([id, label]) => `<button type="button" class="chip${range === id ? " on" : ""}" data-act="vital-range" data-id="${id}">${label}</button>`).join("");
+  const measured = series.filter(pt => !pt.synthetic).slice().reverse().slice(0, 8);
+  const rows = measured.map(pt => `<tr><td>${esc(fmt(pt.at))}</td><td><b>${esc(pt.label || pt.value)}</b></td><td class="muted">${pt.synthetic ? "estimat" : esc(pt.note || "măsurat")}</td></tr>`).join("");
+  const dual = metric === "ta" ? `<div class="legend"><span><i class="swatch sys"></i>Sistolică</span><span><i class="swatch dia"></i>Diastolică</span></div>` : "";
+  return `<div class="vital-expand" data-metric="${esc(metric)}">
+    <div class="vital-expand-head"><div><h3>${esc(def.label)} · istoric</h3><p class="muted">Valoarea de acum față de evoluția pe ${esc(range)}</p></div>
+      <div class="chips">${chips}<button type="button" class="chip" data-act="vital-card" data-id="${esc(metric)}">Închide</button></div>
+    </div>
+    ${svgVitalChart(series, { label: def.label, unit: def.unit, range })}
+    ${dual}
+    <div class="vital-table"><table><thead><tr><th>Moment</th><th>Valoare</th><th>Context</th></tr></thead><tbody>${rows || `<tr><td colspan="3" class="muted">Fără măsurători.</td></tr>`}</tbody></table></div>
+  </div>`;
+}
+function vitalsCardsHtml(p) {
+  const v = latestVital(p);
+  const badTa = v && /^(7|8|9)\d\//.test(String(v.ta));
+  const badAv = v && (Number(v.av) >= 110 || Number(v.av) <= 50);
+  const badSp = v && Number(v.spo2) < 94;
+  const badRr = v && (Number(v.rr) >= 24 || Number(v.rr) <= 10);
+  const open = ui.vitalExpand;
+  const card = (id, label, value, bad) => {
+    const on = open === id;
+    return `<button type="button" class="vital-card${on ? " open" : ""}${bad ? " is-bad" : ""}" data-act="vital-card" data-id="${id}" aria-expanded="${on ? "true" : "false"}">
+      <span>${esc(label)}</span><b class="${bad ? "bad" : ""}">${value}</b><em>atinge pentru grafic</em>
+    </button>`;
+  };
+  return `<div class="vrow">
+      ${card("ta", "Tensiune", v ? esc(v.ta) : "—", badTa)}
+      ${card("av", "Frecvență", v ? esc(v.av) : "—", badAv)}
+      ${card("rr", "Respirație", v && v.rr ? esc(v.rr) : "—", badRr)}
+      ${card("temp", "Temperatură", v ? esc(v.temp) : "—", false)}
+      ${card("spo2", "SpO₂", v ? esc(v.spo2) + "%" : "—", badSp)}
+    </div>${["ta", "av", "rr", "temp", "spo2"].includes(open) ? vitalExpandHtml(p, open) : ""}`;
+}
+function summaryCardsHtml(p) {
+  const notes = (p.notes || []).slice().sort((a, b) => a.at.localeCompare(b.at));
+  const last = notes[notes.length - 1];
+  const meds = (p.meds || []).slice(-3).map(m => `${m.name} ${m.dose}${m.route ? " " + m.route : ""}${m.schedule ? ", " + m.schedule : ""}`).join(" · ") || "Nicio prescriere pe foaie.";
+  const pending = (p.studies || []).filter(s => s.status !== "finalizat").map(s => s.title);
+  const abn = (p.studies || []).flatMap(s => (s.rows || []).filter(r => r.flag).map(r => `${r.name} ${r.value}`));
+  const studyLineText = [pending.length ? "În lucru: " + pending.join(", ") : "", abn.length ? "În afara intervalului: " + abn.slice(0, 3).join(", ") : "Buletine în limite sau fără rezultat nou."].filter(Boolean).join(" ");
+  const open = ui.vitalExpand;
+  const card = (id, title, text) => `<button type="button" class="sum-card${open === id ? " open" : ""}" data-act="vital-card" data-id="${id}" aria-expanded="${open === id ? "true" : "false"}"><h3>${esc(title)}</h3><p>${esc(text)}</p><em>atinge pentru istoric</em></button>`;
+  return `<div class="dgrid">
+      ${card("evo", "Ultima evoluție", last ? last.text : "Nicio evoluție scrisă.")}
+      ${card("meds", "Medicație", meds)}
+      ${card("studies", "Investigații", studyLineText)}
+    </div>${["evo", "meds", "studies"].includes(open) ? vitalExpandHtml(p, open) : ""}`;
+}
 function panelCard(title, sub, body, canAdd, form) {
   const btn = canAdd ? `<button class="btn btn-primary" type="button" data-act="compose">Adaugă</button>` : "";
   const zone = form ? `<div class="add-zone">${form}</div>` : "";
@@ -1574,17 +1893,7 @@ function chartDash(w, p) {
   const closed = p.status === "externat" || p.status === "decedat" || p.status === "transferat";
   const tab = ui.tab || "sumar";
   const can = !closed;
-  const badTa = v && /^(7|8|9)\d\//.test(String(v.ta));
-  const badAv = v && (Number(v.av) >= 110 || Number(v.av) <= 50);
-  const badSp = v && Number(v.spo2) < 94;
-  const badRr = v && (Number(v.rr) >= 24 || Number(v.rr) <= 10);
-  const vitals = `<div class="vrow">
-      <article><span>Tensiune</span><b class="${badTa ? "bad" : ""}">${v ? esc(v.ta) : "—"}</b></article>
-      <article><span>Frecvență</span><b class="${badAv ? "bad" : ""}">${v ? esc(v.av) : "—"}</b></article>
-      <article><span>Respirație</span><b class="${badRr ? "bad" : ""}">${v && v.rr ? esc(v.rr) : "—"}</b></article>
-      <article><span>Temperatură</span><b>${v ? esc(v.temp) : "—"}</b></article>
-      <article><span>SpO₂</span><b class="${badSp ? "bad" : ""}">${v ? esc(v.spo2) + "%" : "—"}</b></article>
-    </div>`;
+  const vitals = vitalsCardsHtml(p);
   if (tab === "evolutie") {
     const notes = (p.notes || []).slice().sort((a, b) => b.at.localeCompare(a.at));
     const body = notes.map(n => `<div class="evo"><strong>${esc(n.author)}</strong> · <span class="muted">${esc(fmt(n.at))}</span><p>${esc(n.text)}</p></div>`).join("") || `<p class="muted">Nicio evoluție scrisă.</p>`;
@@ -1641,18 +1950,7 @@ function chartDash(w, p) {
     const text = letter ? esc(letter.epicrisis) : "";
     return panelCard("Scrisoare", letter ? esc(letter.number) : "Emisă", `<p class="dx-line">${esc((letter && letter.dx) || p.dx)}</p><p class="muted">${text}</p>`, false, "");
   }
-  const notes = (p.notes || []).slice().sort((a, b) => a.at.localeCompare(b.at));
-  const last = notes[notes.length - 1];
-  const meds = (p.meds || []).slice(-3).map(m => `${m.name} ${m.dose}${m.route ? " " + m.route : ""}${m.schedule ? ", " + m.schedule : ""}`).join(" · ") || "Nicio prescriere pe foaie.";
-  const pending = (p.studies || []).filter(s => s.status !== "finalizat").map(s => s.title);
-  const abn = (p.studies || []).flatMap(s => (s.rows || []).filter(r => r.flag).map(r => `${r.name} ${r.value}`));
-  const studyLineText = [pending.length ? "În lucru: " + pending.join(", ") : "", abn.length ? "În afara intervalului: " + abn.slice(0, 3).join(", ") : "Buletine în limite sau fără rezultat nou."].filter(Boolean).join(" ");
-  return `<section class="chart-dash"><div class="dash-body">${vitals}
-    <div class="dgrid">
-      <article><h3>Ultima evoluție</h3><p>${last ? esc(last.text) : "Nicio evoluție scrisă."}</p></article>
-      <article><h3>Medicație</h3><p>${esc(meds)}</p></article>
-      <article><h3>Investigații</h3><p>${esc(studyLineText)}</p></article>
-    </div></div></section>`;
+  return `<section class="chart-dash"><div class="dash-body">${vitals}${summaryCardsHtml(p)}</div></section>`;
 }
 function pagePatient() {
   const w = ward(), p = patient();
@@ -1843,7 +2141,7 @@ function medsCompose(w, p) {
   const finder = ui.compose ? `<div class="card"><div class="card-head"><h2>Adaugă medicație</h2><span class="sub">din magazia secției</span></div><div class="card-body">
       ${menu}
       <div class="search" style="max-width:none;margin-bottom:10px"><input id="med-q" type="text" placeholder="Caută în clasă" value="${esc(ui.medQuery || "")}" aria-label="Caută medicament"></div>
-      <div class="fields" style="margin-bottom:10px"><div><label class="lbl" for="med-qty">Cantitate</label><input id="med-qty" type="number" min="1" value="1"></div><div><label class="lbl" for="med-route">Cale</label><select id="med-route"><option>Oral</option><option>Intravenos</option><option>Subcutanat</option><option>Intramuscular</option><option>Perfuzie</option><option>Inhalator</option></select></div><div><label class="lbl" for="med-rhythm">Ritm</label><select id="med-rhythm"><option>o dată</option><option>la 8 ore</option><option>la 12 ore</option><option>la 24 ore</option><option>la nevoie</option></select></div></div>
+      <div class="fields" style="margin-bottom:10px"><div><label class="lbl" for="med-qty">Cantitate</label><input id="med-qty" type="number" min="1" value="1"></div><div><label class="lbl" for="med-route">Cale</label><select id="med-route"><option value="">Alegeți</option><option>Oral</option><option>Intravenos</option><option>Subcutanat</option><option>Intramuscular</option><option>Perfuzie</option><option>Inhalator</option></select></div><div><label class="lbl" for="med-rhythm">Ritm</label><select id="med-rhythm"><option value="">Alegeți</option><option>o dată</option><option>la 8 ore</option><option>la 12 ore</option><option>la 24 ore</option><option>la nevoie</option></select></div></div>
       <div class="catalog">${hits}</div>
     </div></div>` : "";
   return hold + finder;
@@ -1985,7 +2283,7 @@ function letterHtml(w, p, letter) {
   const L = letter || {};
   const lines = (p.studies || []).map(s => `<li>${esc(studyLine(s))}</li>`).join("");
   return `<article class="letter-sheet">
-    <div class="muted">Cod unitate BH01</div>
+    <div class="muted">${esc((state.hospital && (state.hospital.code || state.hospital.name)) || "Unitate nesetată")}</div>
     <h2>Scrisoare medicală</h2>
     <p class="muted" style="margin-top:4px">${esc(L.number || "Ciornă")} · ${esc(p.fileNo)} · ${esc(w.name)}</p>
     <dl class="kv" style="margin-top:16px">
@@ -2134,7 +2432,7 @@ function admitFieldsAsigurare() {
   return `
     <div><label class="lbl" for="adm-statut">Statut asigurat</label><select id="adm-statut">${optHtml(nomOptions(noms(), "statut_asigurat"), admGet("adm-statut", "Asigurat CNAS"))}</select></div>
     <div><label class="lbl" for="adm-tip-asig">Tip asigurare</label><select id="adm-tip-asig">${optHtml(nomOptions(noms(), "tip_asigurare"), admGet("adm-tip-asig", "Obligatorie CNAS"))}</select></div>
-    <div><label class="lbl" for="adm-casa">Casă asigurări</label><select id="adm-casa">${optHtml(nomOptions(noms(), "case_asigurari"), admGet("adm-casa", "CJAS Bihor"))}</select></div>
+    <div><label class="lbl" for="adm-casa">Casă asigurări</label><select id="adm-casa">${optHtml([""].concat(nomOptions(noms(), "case_asigurari")), admGet("adm-casa", ""))}</select></div>
     <div><label class="lbl" for="adm-calitate">Calitate asigurat</label><select id="adm-calitate">${optHtml(nomOptions(noms(), "calitate_asigurat"), admGet("adm-calitate", "Salariat"))}</select></div>
     <div><label class="lbl" for="adm-judet">Județ</label><select id="adm-judet">${optHtml(nomOptions(noms(), "judete"), admGet("adm-judet", "Bihor"))}</select></div>
     <div class="admit-check"><label class="check"><input id="adm-ins" type="checkbox"${admChecked("adm-ins", true) ? " checked" : ""}> Pacient asigurat</label></div>`;
@@ -2159,7 +2457,7 @@ function admitFieldsClinic(w, free, bed) {
   return `
     <div><label class="lbl" for="adm-bed">Pat <span class="req">*</span></label><select id="adm-bed">${free.map(b => `<option value="${b}"${b === bedSel ? " selected" : ""}>Salon ${Math.ceil(b / 4)} · Pat ${localPat(b)} · nr. ${pad(b)}</option>`).join("")}</select></div>
     <div><label class="lbl" for="adm-md">Medic curant</label><select id="adm-md">${medics(w).map(m => `<option${m === md ? " selected" : ""}>${esc(m)}</option>`).join("")}</select></div>
-    <div><label class="lbl" for="adm-alg">Alergii</label><input id="adm-alg" type="text" value="${esc(admGet("adm-alg", "Nu se cunosc"))}"></div>
+    <div><label class="lbl" for="adm-alg">Alergii</label><input id="adm-alg" type="text" value="${esc(admGet("adm-alg", ""))}" placeholder="gol dacă necunoscute"></div>
     <div class="span-2"><label class="lbl" for="adm-attention">Atenție (TBC, Diabet…)</label><input id="adm-attention" type="text" placeholder="Bolile care cer precauții" value="${esc(admGet("adm-attention"))}"></div>
     <div><label class="lbl" for="adm-blood">Grupa de sânge</label><select id="adm-blood">${bloodOpts}</select></div>
     <div><label class="lbl" for="adm-kin">Aparținător</label><input id="adm-kin" type="text" placeholder="Nume" value="${esc(admGet("adm-kin"))}"></div>
@@ -2291,16 +2589,36 @@ function pageDept() {
   return pageDeptForm(dept);
 }
 function pageDeptForm(dept) {
+  if (dept && !canManageDept(dept.id) && !isDeptUser()) {
+    return topHtml("Acces restricționat", "Departamente", `<button class="btn" type="button" data-act="home">Înapoi</button>`) +
+      `<div class="content"><div class="card"><div class="card-body"><p class="muted">Nu aveți drept pe acest departament.</p></div></div></div>`;
+  }
+  if (dept && isDeptUser() && !accountDeptIds(currentAccount()).includes(dept.id)) {
+    return topHtml("Acces restricționat", "Departamente", `<button class="btn" type="button" data-act="home">Înapoi</button>`) +
+      `<div class="content"><div class="card"><div class="card-body"><p class="muted">Sunteți user pe alt departament.</p></div></div></div>`;
+  }
   const title = dept ? dept.name : "Departament nou";
-  const del = dept ? `<button class="btn" type="button" data-act="del-dept">Șterge</button>` : `<button class="btn" type="button" data-act="home">Renunță</button>`;
-  const cfg = dept ? `<button class="btn" type="button" data-act="dept-config" data-id="${esc(dept.id)}">Configurare și import</button>` : "";
-  return topHtml(title, "Departamente", `${del}${cfg}<button class="btn btn-primary" type="button" data-act="save-dept">Salvează</button>`) + `<div class="content"><p class="lead">Departamentele administrative pot fi configurate ca în Manualul de Administrare: structură de câmpuri + import Excel/CSV.</p>
-    <div class="card"><div class="card-body"><div class="fields">
-      <div><label class="lbl" for="dp-name">Denumire</label><input id="dp-name" type="text" value="${esc(dept ? dept.name : "")}"></div>
-      <div><label class="lbl" for="dp-chief">Responsabil</label><input id="dp-chief" type="text" value="${esc(dept ? dept.chief : "")}"></div>
-      <div><label class="lbl" for="dp-phone">Interior</label><input id="dp-phone" type="text" value="${esc(dept ? dept.phone : "")}"></div>
-      <div class="span-2"><label class="lbl" for="dp-mission">Rol</label><input id="dp-mission" type="text" value="${esc(dept ? dept.mission : "")}"></div>
-    </div></div></div></div>`;
+  const canEdit = !dept || canManageDept(dept.id);
+  const canFields = dept && canEditDeptFields(dept.id);
+  const del = dept && isAdmin1() ? `<button class="btn" type="button" data-act="del-dept">Șterge</button>` : (!dept ? `<button class="btn" type="button" data-act="home">Renunță</button>` : "");
+  const cfg = canFields ? `<button class="btn btn-primary" type="button" data-act="dept-config" data-id="${esc(dept.id)}">Configurează interfața</button>` : "";
+  const admin2 = dept ? (state.access?.accounts || []).find(a => a.id === dept.admin2Id) : null;
+  const users = dept ? (state.access?.accounts || []).filter(a => a.role === "user" && accountDeptIds(a).includes(dept.id)) : [];
+  const lock = !canEdit ? " disabled" : "";
+  return topHtml(title, isAdmin2() ? "Departamentul meu" : "Departamente", `${del}${cfg}${canEdit ? `<button class="btn btn-primary" type="button" data-act="save-dept">Salvează</button>` : ""}`) + `<div class="content">
+    <p class="lead">${canFields ? "Ca Admin 2 puteți adăuga sau șterge câmpuri din interfața departamentului, fără a atinge restul spitalului." : isDeptUser() ? "Cont de user: vedeți și completați datele departamentului. Structura câmpurilor o schimbă doar Admin 2." : "Departamentele administrative: structură de câmpuri + import Excel/CSV. Șeful de departament este Admin 2."}</p>
+    <div class="card" style="margin-bottom:12px"><div class="card-body"><div class="fields">
+      <div><label class="lbl" for="dp-name">Denumire</label><input id="dp-name" type="text" value="${esc(dept ? dept.name : "")}"${lock}></div>
+      <div><label class="lbl" for="dp-chief">Șef departament (Admin 2)</label><input id="dp-chief" type="text" value="${esc(dept ? dept.chief : "")}"${lock}></div>
+      <div><label class="lbl" for="dp-phone">Interior</label><input id="dp-phone" type="text" value="${esc(dept ? dept.phone : "")}"${lock}></div>
+      <div class="span-2"><label class="lbl" for="dp-mission">Rol</label><input id="dp-mission" type="text" value="${esc(dept ? dept.mission : "")}"${lock}></div>
+    </div></div></div>
+    ${dept ? `<div class="card"><div class="card-head"><h2>Acces pe departament</h2><span class="sub">Admin 2 + useri</span></div><div class="card-body">
+      <p style="margin:0 0 8px"><span class="role-badge admin2">Admin 2</span> ${esc(admin2?.name || dept.chief || "—")} <span class="muted">· poate configura câmpurile</span></p>
+      <p style="margin:0 0 8px"><span class="role-badge user">User</span> ${users.length ? users.map(u => esc(u.name)).join(", ") : "niciun user încă"}</p>
+      ${canFields ? `<div class="form-actions" style="justify-content:flex-start;margin-top:10px"><button class="btn" type="button" data-act="dept-config" data-id="${esc(dept.id)}">Deschide configurarea câmpurilor</button></div>` : ""}
+    </div></div>` : ""}
+  </div>`;
 }
 function pageNomenclatoareAdmin() {
   const id = ui.nomId || NOMENCLATOR_CATALOG[0].id;
@@ -2340,23 +2658,42 @@ function pageNomenclatoareAdmin() {
 }
 function pageModuleConfig() {
   const key = ui.moduleKey || "dept:spiaam";
+  const dept = (state.departments || []).find(d => d.id === ui.deptId) || (state.departments || []).find(d => ("dept:" + deptCode(d.name)) === key);
+  if (dept && !canEditDeptFields(dept.id) && !isAdmin1()) {
+    return topHtml("Configurare restricționată", key, `<button class="btn" type="button" data-act="home">Înapoi</button>`) +
+      `<div class="content"><div class="card"><div class="card-body"><p class="muted">Doar Admin 1 sau Admin 2 al acestui departament pot schimba câmpurile.</p></div></div></div>`;
+  }
   const tab = ui.moduleTab || "structura";
   const tabs = [["structura", "Structură"], ["import", "Import"], ["validare", "Validare"]].map(([id, label]) =>
     `<button type="button" class="tab${tab === id ? " on" : ""}" data-act="module-tab" data-id="${id}">${label}</button>`
   ).join("");
-  const cfg = (state.moduleConfigs && state.moduleConfigs[key]) || { fields: [], importMode: "excel_template", label: key };
+  const cfg = ensureModuleConfig(key, dept?.name || key);
   let body = "";
   if (tab === "structura") {
     const rows = (cfg.fields || []).map((f, i) => `<tr>
-      <td><label class="check"><input type="checkbox" data-act="mod-field-en" data-i="${i}"${f.enabled !== false ? " checked" : ""}> ${esc(f.key)}</label></td>
+      <td><label class="check"><input type="checkbox" data-act="mod-field-en" data-i="${i}"${f.enabled !== false ? " checked" : ""}> <span class="mono">${esc(f.key)}</span></label></td>
       <td><input type="text" value="${esc(f.label)}" data-act="mod-field-label" data-i="${i}" style="height:32px;width:100%"></td>
-      <td>${esc(f.type)}</td>
+      <td>
+        <select data-act="mod-field-type" data-i="${i}" style="height:32px">
+          ${[["text","Text"],["number","Număr"],["date","Dată"],["select","Listă"]].map(([v, l]) => `<option value="${v}"${f.type === v ? " selected" : ""}>${l}</option>`).join("")}
+        </select>
+      </td>
       <td><label class="check"><input type="checkbox" data-act="mod-field-req" data-i="${i}"${f.required ? " checked" : ""}> Obligatoriu</label></td>
+      <td><button class="btn btn-sm" type="button" data-act="mod-field-del" data-i="${i}">Șterge</button></td>
     </tr>`).join("");
-    body = `<div class="card"><div class="card-head"><h2>Câmpuri modul</h2><span class="sub">${esc(cfg.label || key)}</span></div><div class="card-body">
-      <p class="muted">Activarea/dezactivarea și etichetele locale — ca „Câmpuri definite de utilizator” din Manualul de Administrare.</p>
-      <table><thead><tr><th>Câmp</th><th>Etichetă</th><th>Tip</th><th></th></tr></thead><tbody>${rows || `<tr><td colspan="4" class="muted">Apăsați Încarcă preset.</td></tr>`}</tbody></table>
-      <div class="form-actions" style="justify-content:flex-start"><button class="btn" type="button" data-act="module-preset">Încarcă preset</button><button class="btn btn-primary" type="button" data-act="module-save">Salvează structura</button></div>
+    body = `<div class="card" style="margin-bottom:12px"><div class="card-head"><h2>Câmpuri pe ecran</h2><span class="sub">${esc(cfg.label || key)} · ${(cfg.fields || []).filter(f => f.enabled !== false).length} active</span></div><div class="card-body">
+      <p class="muted" style="margin-top:0">Adăugați sau ștergeți câmpuri. Admin 2 configurează doar departamentul său; Admin 1 vede tot spitalul.</p>
+      <table><thead><tr><th>Cheie</th><th>Etichetă pe ecran</th><th>Tip</th><th>Obligatoriu</th><th></th></tr></thead><tbody>${rows || `<tr><td colspan="5" class="muted">Niciun câmp — adăugați unul mai jos sau încărcați preset.</td></tr>`}</tbody></table>
+      <div class="form-actions" style="justify-content:flex-start;flex-wrap:wrap"><button class="btn" type="button" data-act="module-preset">Încarcă preset</button><button class="btn btn-primary" type="button" data-act="module-save">Salvează structura</button></div>
+    </div></div>
+    <div class="card"><div class="card-head"><h2>Adaugă câmp nou</h2><span class="sub">apare imediat în interfață</span></div><div class="card-body">
+      <div class="fields">
+        <div><label class="lbl" for="nf-label">Etichetă</label><input id="nf-label" type="text" placeholder="ex. Observații SPIAAM"></div>
+        <div><label class="lbl" for="nf-type">Tip</label><select id="nf-type"><option value="text">Text</option><option value="number">Număr</option><option value="date">Dată</option><option value="select">Listă</option></select></div>
+        <div><label class="lbl" for="nf-key">Cheie (opțional)</label><input id="nf-key" type="text" placeholder="se generează din etichetă"></div>
+        <div><label class="check" style="margin-top:22px"><input id="nf-req" type="checkbox"> Obligatoriu</label></div>
+      </div>
+      <div class="form-actions"><button class="btn btn-primary" type="button" data-act="mod-field-add">Adaugă câmpul</button></div>
     </div></div>`;
   } else if (tab === "import") {
     body = `<div class="card"><div class="card-head"><h2>Profil import</h2></div><div class="card-body"><div class="fields">
@@ -2961,69 +3298,14 @@ function samePerson(a, b) {
 }
 function kinOf(p) {
   if (p && p.kinName) return { who: p.kinWho || "aparținător", name: p.kinName, phone: p.kinPhone || "" };
-  const n = fnv(p.cnp || p.id);
-  const who = ["soția", "soțul", "fiica", "fiul", "sora", "fratele"][n % 6];
-  const names = ["Popa Elena", "Pop Andrei", "Ionescu Ana", "Stan Mihai", "Luca Maria", "Horvat Radu"];
-  const phone = "07" + pad(20 + (n % 70)) + " " + String(100 + (n % 800)) + " " + String(100 + ((n >> 8) % 800));
-  return { who, name: names[n % names.length], phone };
+  return { who: "", name: "", phone: "" };
 }
 function antecedentsOf(p) {
   if (p && p.antecedents) return String(p.antecedents).split(/\.\s+/).map(s => s.replace(/\.$/, "").trim()).filter(Boolean);
-  const pool = [
-    "Hipertensiune arterială esențială, din 2014",
-    "Dislipidemie, statină la domiciliu",
-    "Diabet zaharat tip 2, fără insulină",
-    "Apendicectomie în 1998",
-    "Fost fumător, oprit de 6 ani",
-    "Boală cardiacă ischemică cunoscută",
-    "Hernie inghinală operată în 2019",
-    "Astm bronșic, salbutamol la nevoie"
-  ];
-  const n = fnv(p.cnp || p.id);
-  const a = pool[n % pool.length];
-  const b = pool[(n >>> 3) % pool.length];
-  const list = a === b ? [a] : [a, b];
-  if (p.allergies && p.allergies !== "Nu se cunosc") list.push("Alergie medicamentoasă: " + p.allergies);
-  return list;
+  return [];
 }
-function priorEpisode(p, k) {
-  const specs = [
-    { ward: "Cardiologie", dx: "I20.0 Angină pectorală instabilă", meds: ["Bisoprolol 5 mg", "Atorvastatină 40 mg", "Aspirină 75 mg"] },
-    { ward: "Medicină internă", dx: "J18.9 Pneumonie", meds: ["Ceftriaxonă 1 g", "Paracetamol 1 g"] },
-    { ward: "Chirurgie generală", dx: "K80.0 Litiază biliară cu colecistită acută", meds: ["Metamizol 1 g", "Ceftriaxonă 1 g", "Enoxaparină 40 mg"] }
-  ];
-  const n = fnv((p.cnp || p.id) + ":" + k);
-  const spec = specs[k % specs.length];
-  const admitAgo = 420 + k * 340 + (n % 40);
-  const stay = 4 + (n % 8);
-  const admitted = stamp(admitAgo, 9);
-  const discharged = stamp(admitAgo - stay, 12);
-  const year = admitted.slice(0, 4);
-  const verb = p.sex === "F" ? "internată" : "internat";
-  const labs = baseRows().map(r => ({ ...r }));
-  if (k === 0) labs.find(r => r.name === "CRP").value = "18";
-  const studies = [
-    { kind: "analize", title: "Buletin de analize", result: "", rows: labs },
-    { kind: "rx", title: k === 1 ? "Radiografie abdominală" : "Radiografie toracică", result: k === 1 ? "Fără aer liber subdiafragmatic. Fără nivele hidroaerice." : "Cord în limite. Fără condensare. Sinusuri libere.", rows: [] }
-  ];
-  if (n % 2 === 0) studies.push({ kind: "ct", title: k === 2 ? "CT abdomen și pelvis" : "CT torace", result: k === 2 ? "Litiază veziculară. Fără colecție perihepatică." : "Fără embolie pulmonară. Fără revărsat.", rows: [] });
-  else studies.push({ kind: "echo", title: "Ecografie abdominală", result: "Fără lichid liber. Vezica biliară cu calcul.", rows: [] });
-  if (k === 2) studies.push({ kind: "rmn", title: "RMN coloană lombară", result: "Protruzie discală L4–L5, fără compresie severă.", rows: [] });
-  return {
-    id: "prior-" + (p.cnp || p.id) + "-" + k,
-    current: false,
-    ward: spec.ward,
-    admitted: admitted,
-    discharged: discharged,
-    status: "externat",
-    dx: spec.dx,
-    physician: spec.ward === "Cardiologie" ? "Dr. Popescu Ion" : spec.ward === "Chirurgie generală" ? "Dr. Andrei Cosmin" : "Dr. Ionescu Ana",
-    type: n % 2 ? "Urgență" : "Programată",
-    fileNo: "FO-" + year + "-" + pad((n % 80) + 1),
-    letterNo: "SM-" + year + "-" + pad((n % 80) + 1),
-    epicrisis: p.last + " " + p.first + " a fost " + verb + " în " + spec.ward + " pentru " + spec.dx + ". Evoluție favorabilă. S-a externat în stare stabilă, cu recomandare de control.",
-    studies, meds: spec.meds
-  };
+function priorEpisode(_p, _k) {
+  return null;
 }
 function episodeFromRecord(w, p, current) {
   return {
@@ -3050,8 +3332,10 @@ function patientEpisodes(p) {
       if (samePerson(x, p)) live.push(episodeFromRecord(w, x, x.id === p.id && x.status !== "externat"));
     });
   });
-  const priors = [0, 1, 2].map(k => priorEpisode(p, k)).filter(ep => !live.some(x => x.dx === ep.dx && x.ward === ep.ward));
-  return live.concat(priors).sort((a, b) => (b.admitted || "").localeCompare(a.admitted || ""));
+  (p.clinicalEpisodes || []).forEach(ep => {
+    if (!live.some(x => x.id === ep.id || (x.fileNo && x.fileNo === ep.fileNo))) live.push(ep);
+  });
+  return live.sort((a, b) => (b.admitted || "").localeCompare(a.admitted || ""));
 }
 function histBlob(ep) {
   const rows = (ep.studies || []).flatMap(s => [kindLabel(s.kind), s.title, s.result, ...(s.rows || []).map(r => r.name + " " + r.value)]);
@@ -3176,6 +3460,7 @@ function commitDischarge() {
   const w = ward(), p = patient();
   if (!w || !p || p.status === "externat") return;
   const fields = dischargeFields(p, w);
+  fields.dxCode = icdCode(fields.dx) || p.dxCode;
   const missing = [];
   if (!fields.dx || fields.dx.trim().length < 3) missing.push("diagnosticul");
   if (!fields.epicrisis || fields.epicrisis.trim().length < 50) missing.push("epicriza (min. 50 caractere)");
@@ -3185,39 +3470,60 @@ function commitDischarge() {
   if (missing.length) { toast("Completați: " + missing.join(", ") + ".", "err"); return; }
   const openStudies = (p.studies || []).filter(s => s.status !== "finalizat");
   if (openStudies.length) {
-    toast(`Mai sunt ${openStudies.length} investigații în lucru. Finalizați-le sau continuați doar după ce confirmați în epicriză.`, "err");
+    toast(`Mai sunt ${openStudies.length} investigații în lucru. Finalizați-le înainte de externare.`, "err");
+    return;
   }
-  p.letter = {
-    number: "SM-" + todayKey().replace(/-/g, "") + "-" + String(p.fileNo || "").slice(-3),
-    issued: nowStamp(),
-    dx: fields.dx,
-    secondary: fields.secondary,
-    history: fields.history || "",
-    epicrisis: fields.epicrisis,
-    studies: fields.studies || "",
-    treatment: fields.treatment || "",
-    state: fields.state || fields.dischargeStatus,
-    dischargeStatus: fields.dischargeStatus,
-    dischargeType: fields.dischargeType,
-    recommendations: fields.recommendations
-  };
-  p.dxAdmit = p.dxAdmit || p.dx;
-  p.dx = fields.dx;
-  p.dxCode = icdCode(fields.dx) || p.dxCode;
-  p.secondary = fields.secondary || p.secondary;
-  p.dischargeStatus = fields.dischargeStatus;
-  p.dischargeType = fields.dischargeType;
-  p.status = fields.dischargeType === "deces" || fields.dischargeStatus === "decedat" ? "decedat" : "externat";
-  p.discharged = p.letter.issued;
-  const bed = p.bed;
-  p.bed = null;
-  w.patients = w.patients.filter(x => x.id !== p.id);
-  w.discharged.unshift(p);
-  ui.draft = null;
-  ui.tab = "scrisoare";
-  persist();
-  toast("Scrisoarea a fost emisă. Patul " + pad(bed) + " este liber.");
-  go({ page: "letter" }, true);
+  void (async () => {
+    let documentId = null;
+    let letterNo = null;
+    if (live) {
+      try {
+        if (!p.clinical?.encounterId) await ensureAndLoadChart(w, p, { pathway: p.pathway || "direct" });
+        const discharged = await saveClinicalDischarge(p, fields);
+        documentId = discharged.documentId;
+        try {
+          const doc = await requestDocumentPdf(p, "discharge_letter");
+          letterNo = doc.number;
+          p.clinicalDocumentId = doc.id;
+        } catch (_e) { /* discharge deja creat */ }
+      } catch (err) {
+        toast(err instanceof Error ? err.message : "Externarea clinică a eșuat.", "err");
+        return;
+      }
+    }
+    p.letter = {
+      number: letterNo || ("SM-" + todayKey().replace(/-/g, "") + "-" + String(p.fileNo || "").slice(-6)),
+      issued: nowStamp(),
+      dx: fields.dx,
+      secondary: fields.secondary,
+      history: fields.history || "",
+      epicrisis: fields.epicrisis,
+      studies: fields.studies || "",
+      treatment: fields.treatment || "",
+      state: fields.state || fields.dischargeStatus,
+      dischargeStatus: fields.dischargeStatus,
+      dischargeType: fields.dischargeType,
+      recommendations: fields.recommendations,
+      documentId
+    };
+    p.dxAdmit = p.dxAdmit || p.dx;
+    p.dx = fields.dx;
+    p.dxCode = fields.dxCode || p.dxCode;
+    p.secondary = fields.secondary || p.secondary;
+    p.dischargeStatus = fields.dischargeStatus;
+    p.dischargeType = fields.dischargeType;
+    p.status = fields.dischargeType === "deces" || fields.dischargeStatus === "decedat" ? "decedat" : "externat";
+    p.discharged = p.letter.issued;
+    const bed = p.bed;
+    p.bed = null;
+    w.patients = w.patients.filter(x => x.id !== p.id);
+    w.discharged.unshift(p);
+    ui.draft = null;
+    ui.tab = "scrisoare";
+    persist();
+    toast("Externare salvată în baza clinică. Patul " + pad(bed) + " este liber.");
+    go({ page: "letter" }, true);
+  })();
 }
 function systemRoster() {
   const seen = new Map();
@@ -3250,9 +3556,9 @@ function loadFromSystem() {
   set("adm-sex", parsed.ok ? parsed.sex : person.sex);
   set("adm-phone", person.phone || "");
   set("adm-addr", person.address || "");
-  set("adm-alg", person.allergies || "Nu se cunosc");
-  set("adm-blood", person.blood || "Necunoscută");
-  set("adm-casa", person.casa || "CJAS Bihor");
+  set("adm-alg", person.allergies || "");
+  set("adm-blood", person.blood || "");
+  set("adm-casa", person.casa || "");
   set("adm-type", person.type || "Urgență");
   const w = ward();
   const dxList = (w && DX[w.focus]) || DX.general;
@@ -3339,67 +3645,118 @@ function saveAdmit() {
   const p = {
     id: uid(), last, first, sex, birth, cnp, phone: String(admitField("adm-phone")),
     insured: admitField("adm-ins", true) !== false && admitField("adm-ins", true) !== "",
-    casa: String(admitField("adm-casa", "CJAS Bihor")),
+    casa: String(admitField("adm-casa", "")),
     statutAsigurat: String(admitField("adm-statut")), tipAsigurare: String(admitField("adm-tip-asig")), calitateAsigurat: String(admitField("adm-calitate")),
     judet: String(admitField("adm-judet")), idAct: String(admitField("adm-act")), idActNo: String(admitField("adm-act-nr")),
     presentationPlace: String(admitField("adm-garda")), criteriuInternare: String(admitField("adm-criteriu")), regimMasa: String(admitField("adm-regim")),
     attention: String(admitField("adm-attention")),
     admitted: nowStamp(), type: String(admitField("adm-type")) || "Urgență", bed, physician,
-    dxCode: icdCode(dx), dx, dxAdmit: dx, allergies: String(admitField("adm-alg")) || "Nu se cunosc",
-    blood: String(admitField("adm-blood")) || "Necunoscută", address: String(admitField("adm-addr")) || "—",
-    referrer: String(admitField("adm-from")) || "Prezentare directă",
+    dxCode: icdCode(dx), dx, dxAdmit: dx, allergies: String(admitField("adm-alg")),
+    blood: String(admitField("adm-blood")), address: String(admitField("adm-addr")),
+    referrer: String(admitField("adm-from")),
     kinName: String(admitField("adm-kin")), kinWho: "", kinPhone: String(admitField("adm-kin-phone")),
     bodyKg: Number(admitField("adm-kg")) || null, heightCm: Number(admitField("adm-cm")) || null,
     reason: String(admitField("adm-reason")), antecedents: String(admitField("adm-ante")),
-    consentAdmit: !!admitField("adm-ca", true),
+    consentAdmit: !!admitField("adm-ca", false),
     consentProc: !!admitField("adm-cp", false),
-    status: "internat", fileNo: nextFileNo(w),
-    vitals: [], studies: [], supplies: [], meds: [], secondary: String(admitField("adm-sec")), weight: 1.2, notes: [{ at: nowStamp(), author: physician, text: "Internare înregistrată." }],
+    pathway: String(admitField("adm-pathway") || (String(admitField("adm-type")) === "Programată" ? "ambulatory" : (String(admitField("adm-garda") || "").toLowerCase().includes("upu") ? "upu" : "direct"))),
+    status: "internat", fileNo: null,
+    vitals: [], studies: [], supplies: [], meds: [], secondary: String(admitField("adm-sec")), weight: 1.2,
+    notes: [{ at: nowStamp(), author: physician || (ui.accountName || ""), text: "Internare înregistrată." }],
     letter: null, discharged: null
   };
   w.patients.push(p);
-  if (!w.physicians.includes(physician)) w.physicians.push(physician);
-  if (!(w.staff || []).some(s => s.role === "medic" && s.name === physician)) {
+  if (physician && !w.physicians.includes(physician)) w.physicians.push(physician);
+  if (physician && !(w.staff || []).some(s => s.role === "medic" && s.name === physician)) {
     w.staff = w.staff || [];
     w.staff.push({ id: uid(), name: physician, role: "medic" });
   }
   persist();
   ui.admitDraft = null;
   ui.admitStep = 0;
-  toast(last + " " + first + " a fost internat pe patul " + pad(bed) + "." + (coded ? "" : " Diagnosticul nu are cod ICD."));
-  go({ page: "patient", patientId: p.id, tab: "sumar" }, true);
+  void commitAdmitClinical(w, p, bed).then(() => {
+    toast(last + " " + first + (sex === "F" ? " a fost internată" : " a fost internat") + " pe patul " + pad(bed) + "." + (coded ? "" : " Diagnosticul nu are cod ICD."));
+    go({ page: "patient", patientId: p.id, tab: "sumar" }, true);
+  }).catch(err => {
+    toast(err instanceof Error ? err.message : "Internarea clinică a eșuat.", "err");
+    go({ page: "patient", patientId: p.id, tab: "sumar" }, true);
+  });
 }
 function addVital() {
-  const p = patient();
+  const w = ward(), p = patient();
   const ta = val("v-ta"), av = val("v-av"), temp = val("v-temp"), spo2 = val("v-spo"), rr = val("v-rr");
   if (!ta || !av || !temp || !spo2 || !rr) { toast("Completați tensiunea, alura, respirația, temperatura și SpO₂.", "err"); return; }
-  p.vitals.push({ at: nowStamp(), ta, av, temp, spo2, rr, note: val("v-note") });
+  const row = { at: nowStamp(), ta, av, temp, spo2, rr, note: val("v-note") };
+  p.vitals.push(row);
   persist();
-  toast("Constantele au fost înregistrate.");
-  go({ tab: "monitor" });
+  void (async () => {
+    if (live && w?.apiId) {
+      try {
+        if (!p.clinical) await ensureAndLoadChart(w, p, { pathway: p.pathway || "direct" });
+        const saved = await saveClinicalVital(p, { ta, av, temp, spo2, rr, note: row.note || undefined });
+        row.id = saved.id;
+        row.clinical = true;
+        persist();
+        toast("Constantele au fost salvate în baza clinică.");
+      } catch (err) {
+        toast(err instanceof Error ? err.message : "Constantele rămân doar local.", "err");
+      }
+    } else toast("Constantele au fost înregistrate local (fără sesiune API).");
+    go({ tab: "monitor" });
+  })();
 }
 function orderStudy() {
-  const p = patient();
+  const w = ward(), p = patient();
   const kind = val("st-kind") || "analize";
   const preset = { analize: "Buletin de analize", rx: "Radiografie toracică", ct: "CT" }[kind];
-  p.studies.unshift({ id: uid(), kind, title: val("st-title") || preset, at: nowStamp(), status: "in-lucru", result: "", rows: [] });
+  const title = val("st-title") || preset;
+  const study = { id: uid(), kind, title, at: nowStamp(), status: "in-lucru", result: "", rows: [] };
+  p.studies.unshift(study);
   persist();
-  toast("Investigația a fost solicitată.");
-  go({ tab: kind === "analize" ? "analize" : "imagistica", compose: true });
+  void (async () => {
+    if (live && w?.apiId) {
+      try {
+        if (!p.clinical) await ensureAndLoadChart(w, p, { pathway: p.pathway || "direct" });
+        const saved = await saveClinicalServiceRequest(p, kind === "analize" ? "lab" : kind, title);
+        study.serviceRequestId = saved.id;
+        study.clinical = true;
+        persist();
+        toast("Cererea a fost trimisă în baza clinică / LIS.");
+      } catch (err) {
+        toast(err instanceof Error ? err.message : "Cererea a rămas doar local.", "err");
+      }
+    } else toast("Investigația a fost solicitată local.");
+    go({ tab: kind === "analize" ? "analize" : "imagistica", compose: true });
+  })();
 }
 function finalizeStudy(id) {
   const p = patient();
   const s = p.studies.find(x => x.id === id);
   if (!s) return;
+  if (s.kind === "analize") {
+    const rows = (s.rows || []).filter(r => r.value != null && String(r.value).trim() !== "" && String(r.value).trim() !== "în limite");
+    if (!rows.length) {
+      toast("Introduceți valorile de laborator (nume, valoare, unitate). Softul nu inventează rezultate.", "err");
+      go({ tab: "analize", compose: true, resultStudyId: id });
+      return;
+    }
+    s.rows = rows;
+    s.result = "";
+  } else {
+    const manual = val("st-result") || s.result;
+    if (!manual || !String(manual).trim()) {
+      toast("Introduceți rezultatul imagistic. Softul nu completează automat buletinul.", "err");
+      go({ tab: "imagistica", compose: true, resultStudyId: id });
+      return;
+    }
+    s.result = String(manual).trim();
+  }
   s.status = "finalizat";
-  if (s.kind === "analize" && s.set && (s.rows || []).length) s.rows.forEach(r => { if (!r.value) { r.value = "în limite"; r.flag = ""; } });
-  else if (s.kind === "analize") s.rows = baseRows();
-  if (s.kind === "rx") s.result = "Examinare efectuată. Fără modificări acute descrise în buletin.";
-  if (s.kind === "ct") s.result = "Examinare CT efectuată. Fără leziune acută descrisă în buletin.";
-  if (s.kind === "rmn") s.result = "Examinare RMN efectuată. Fără leziune acută descrisă în buletin.";
-  if (s.kind === "echo") s.result = "Examinare ecografică efectuată. Fără colecție sau leziune focală descrisă.";
+  s.resultAuthor = ui.accountName || currentAccount()?.name || "";
+  s.resultAt = nowStamp();
   persist();
-  toast("Rezultatul a fost atașat la foaie.");
+  void postStudyResult(p, s).catch(() => {});
+  toast("Rezultatul introdus a fost atașat la foaie.");
   go({ tab: s.kind === "analize" ? "analize" : "imagistica" });
 }
 function confirmMed() {
@@ -3500,11 +3857,29 @@ function giveMed(id, forced) {
   item.qty -= qty;
   p.meds = p.meds || [];
   const nurse = (w.staff || []).find(s => s.role === "asistenta");
-  p.meds.push({ id: uid(), name: item.name, dose: item.dose, group: item.group, qty, unit: item.unit, route: val("med-route") || routeFor(item.name, item.dose), schedule: val("med-rhythm") || rhythmFor(item.name), by: (nurse && nurse.name) || p.physician || "", at: nowStamp() });
+  const route = val("med-route") || routeFor(item.name, item.dose) || "";
+  const schedule = val("med-rhythm") || rhythmFor(item.name) || "";
+  if (!item.dose) { toast("Medicația trebuie să aibă doză. Completați doza în magazie înainte de prescriere.", "err"); return; }
+  if (!route) { toast("Alegeți calea de administrare. Softul nu o presupune „Oral”.", "err"); return; }
+  const medRow = { id: uid(), name: item.name, dose: item.dose, group: item.group, qty, unit: item.unit, route, schedule, by: ui.accountName || (nurse && nurse.name) || p.physician || "", at: nowStamp() };
+  p.meds.push(medRow);
   ui.holdMed = null;
   persist();
-  toast(item.name + " a fost prescris și descărcat din magazie.");
-  go({ tab: "medicatie" });
+  void (async () => {
+    if (live && w.apiId) {
+      try {
+        if (!p.clinical) await ensureAndLoadChart(w, p, { pathway: p.pathway || "direct" });
+        const saved = await saveClinicalMedication(p, medRow);
+        medRow.clinicalId = saved.id;
+        medRow.clinical = true;
+        persist();
+        toast(item.name + " a fost prescris în baza clinică.");
+      } catch (err) {
+        toast(err instanceof Error ? err.message : "Prescrierea a rămas doar local.", "err");
+      }
+    } else toast(item.name + " a fost prescris local.");
+    go({ tab: "medicatie" });
+  })();
 }
 function addMed() {
   const w = adminWard();
@@ -3567,11 +3942,11 @@ async function addNote() {
   const text = val("evo-text");
   if (!text) { toast("Scrieți evoluția.", "err"); return; }
   p.notes = p.notes || [];
-  const author = val("evo-author") || dutyName(w, "medic");
+  const author = ui.accountName || val("evo-author") || dutyName(w, "medic");
   const localNote = { at: nowStamp(), author, text };
   if (live && w.apiId) {
     try {
-      if (!p.clinical) await ensureAndLoadChart(w, p);
+      if (!p.clinical) await ensureAndLoadChart(w, p, { pathway: p.pathway || "direct" });
       const saved = await saveClinicalNote(p, text, "evolution");
       localNote.id = saved.id;
       localNote.clinical = true;
@@ -3789,7 +4164,15 @@ document.body.addEventListener("click", e => {
   if (act === "patient") { void openPatientChart(el.dataset.id || ui.wardId, el.dataset.pid, el.dataset.tab || "sumar"); }
   if (act === "protocol") go({ page: "protocol", wardId: el.dataset.id || ui.wardId, patientId: el.dataset.pid }, true);
   if (act === "bed") go({ page: "admit", bed: Number(el.dataset.bed), admitStep: 0, admitDraft: null }, true);
-  if (act === "tab") go({ tab: el.dataset.tab, compose: false });
+  if (act === "tab") go({ tab: el.dataset.tab, compose: false, vitalExpand: null });
+  if (act === "vital-card") {
+    const id = el.dataset.id;
+    const next = ui.vitalExpand === id ? null : id;
+    const def = vitalMetricDefs()[id];
+    const range = next && def ? (def.ranges.some(([r]) => r === ui.vitalRange) ? ui.vitalRange : def.ranges[0][0]) : ui.vitalRange;
+    go({ vitalExpand: next, vitalRange: range || "ore" });
+  }
+  if (act === "vital-range") go({ vitalRange: el.dataset.id });
   if (act === "compose") {
     if (!ui.compose && ui.tab === "imagistica") ui.studyKind = ["echo","rx","ct","rmn"].includes(ui.imgKind) ? ui.imgKind : "rx";
     if (!ui.compose && ui.tab === "analize") ui.studyKind = "analize";
@@ -4174,17 +4557,37 @@ function doTransfer() {
   if (!dest) { toast("Alegeți secția destinație.", "err"); return; }
   if (!bed || !freeBeds(dest).includes(bed)) { toast("Patul este ocupat sau lipsește. Alegeți un pat liber.", "err"); return; }
   if (!note || note.length < 8) { toast("Nota de transfer este obligatorie (min. 8 caractere).", "err"); return; }
-  w.patients = w.patients.filter(x => x.id !== p.id);
-  p.bed = bed;
-  p.notes = p.notes || [];
-  p.notes.unshift({ at: nowStamp(), author: p.physician || "Sistem", text: `Transfer din ${w.name} către ${dest.name}, pat ${pad(bed)}. ${note}` });
-  p.transfers = p.transfers || [];
-  p.transfers.push({ at: nowStamp(), from: w.name, to: dest.name, bed, note });
-  dest.patients.push(p);
-  ui.transferNote = "";
-  persist();
-  toast(`Pacient transferat pe ${dest.name}. Patul pe ${w.name} e liber.`);
-  go({ page: "patient", wardId: dest.id, patientId: p.id, transferOpen: false }, true);
+  void (async () => {
+    if (live) {
+      try {
+        if (!p.clinical?.admissionId) await ensureAndLoadChart(w, p, { pathway: p.pathway || "direct" });
+        if (!dest.apiId) throw new Error("Secția destinație nu este în baza clinică.");
+        const bedId = resolveApiBedId(dest, bed);
+        if (!bedId) throw new Error("Patul destinație nu are id clinic.");
+        await saveClinicalTransfer(p, { wardId: dest.apiId, bedId, note });
+        await refreshWardPhysicians(dest);
+        if ((dest.apiPhysicians || []).length) {
+          p.physician = dest.apiPhysicians[0].name;
+        } else if (dest.chief) {
+          p.physician = dest.chief;
+        }
+      } catch (err) {
+        toast(err instanceof Error ? err.message : "Transferul clinic a eșuat.", "err");
+        return;
+      }
+    }
+    w.patients = w.patients.filter(x => x.id !== p.id);
+    p.bed = bed;
+    p.notes = p.notes || [];
+    p.notes.unshift({ at: nowStamp(), author: ui.accountName || p.physician || "", text: `Transfer din ${w.name} către ${dest.name}, pat ${pad(bed)}. ${note}` });
+    p.transfers = p.transfers || [];
+    p.transfers.push({ at: nowStamp(), from: w.name, to: dest.name, bed, note, physician: p.physician });
+    dest.patients.push(p);
+    ui.transferNote = "";
+    persist();
+    toast(`Pacient transferat pe ${dest.name}. Patul pe ${w.name} e liber.`);
+    go({ page: "patient", wardId: dest.id, patientId: p.id, transferOpen: false }, true);
+  })();
 }
 
 document.body.addEventListener("change", e => {
@@ -4209,6 +4612,7 @@ document.addEventListener("keydown", e => {
   if (e.key === "Enter" && e.target.id === "zena-q") { e.preventDefault(); zenaAsk(e.target.value); return; }
   if (e.key === "Enter" && e.target.id === "ai-q") { e.preventDefault(); aiConfigure(e.target.value); return; }
   if (e.key !== "Escape") return;
+  if (ui.vitalExpand) { go({ vitalExpand: null }); return; }
   if (ui.wardMenuOpen) { go({ wardMenuOpen: false }); return; }
   if (ui.histOpen) { go({ histOpen: false, histDoc: "" }); return; }
   if (ui.zenaOpen) { go({ zenaOpen: false }); return; }
@@ -4218,14 +4622,14 @@ document.addEventListener("keydown", e => {
 });
 
 async function openPatientChart(wardId, patientId, tab) {
-  go({ page: "patient", wardId, patientId, tab, draft: null, compose: false }, true);
+  go({ page: "patient", wardId, patientId, tab, draft: null, compose: false, vitalExpand: null, vitalRange: "ore" }, true);
   if (!live) return;
   const w = state.wards.find(x => x.id === wardId);
   const p = w && findPatient(w, patientId);
   if (!w || !p || !w.apiId) return;
   try {
     showLiveBar("Se leagă foaia de baza clinică…");
-    await ensureAndLoadChart(w, p);
+    await ensureAndLoadChart(w, p, { pathway: p.pathway || "direct" });
     persist();
     render();
     showLiveBar("Foaie clinică activă pentru " + p.last + " " + p.first + ".");
@@ -4583,16 +4987,16 @@ async function bootCollection() {
     if (document && Array.isArray(document.wards)) applyCollection(document);
     else state.synthetic = true;
     try {
+      await loadStructureFromApi(state, ui, { persist });
       await hydrateBoardOccupancy();
-      const missing = state.wards.some(w => !w.apiId);
-      if (missing) await syncStructureToApi();
-      else persist();
+      for (const w of state.wards) await refreshWardPhysicians(w);
+      persist();
     } catch (syncErr) {
-      ui.platformNote = "Panoul clinic nu a putut fi citit încă. Foaia rămâne utilizabilă.";
+      ui.platformNote = "Structura clinică nu a putut fi citită. Softul nu creează secții automat.";
     }
     await refreshPilotCache();
     render();
-    showLiveBar("Pilot județean: census unic, integrări, gărzi/pontaj, farmacie, lab, rapoarte, Zena admin, fluxuri.");
+    showLiveBar("Structură din bază · fără inventare clinice · foaia scrie în API.");
   } catch (err) {
     live = false;
     showLiveBar("Fără legătură la baza spitalului. Modificările rămân doar în acest browser.");
