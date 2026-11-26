@@ -1,4 +1,4 @@
-import { apiJson } from "./api.js";
+﻿import { apiJson } from "./api.js";
 import { ensureSession } from "./session.js";
 import { hydrateBoardOccupancy as hydrateBoardMod, syncStructureToApi as syncStructureMod, loadStructureFromApi, resolveApiBedId } from "./sync.js";
 import {
@@ -200,8 +200,9 @@ const seeded = ALLOW_DEMO_SEED ? fillArchive(state.wards) : false;
 const profiles = false;
 const groups = fillSupplyGroups(state.wards);
 const chart = false;
-if (seeded || profiles || groups || ensureConfig() || ensureAccess() || chart) persist();
-let ui = { page: "home", wardId: null, patientId: null, tab: "sumar", filter: "all", query: "", bed: null, draft: null, view: "paturi", gest: "materiale", medQuery: "", magQuery: "", magClass: "", studyQuery: "", studyKind: "analize", drill: null, period: "azi", staffCat: "medici", deptId: null, labGroup: "uzuale", holdMed: null, doctor: null, compose: false, sheetPage: 0, calOpen: false, calMonth: "", rangeFrom: "", rangeTo: "", zenaOpen: false, zenaThread: [], zenaDraft: "", aiHeard: "", aiReply: "", aiDemo: 0, letterDraft: null, supClass: "Toate", imgKind: "", histOpen: false, histQuery: "", histDoc: "", openAlerts: [], adminIn: true, wardScopeIds: null, hospitalWideAccess: true, apiBoardTotal: 0, platformNote: "", adminTab: "ops", pilotCache: null, flowKind: "patient", wardMenuOpen: false, apptDay: "", apptPractitioner: "", admitStep: 0, admitDraft: null, vitalExpand: null, vitalRange: "ore" };
+const hrReady = ensurePeopleHr();
+if (seeded || profiles || groups || ensureConfig() || ensureAccess() || chart || hrReady) persist();
+let ui = { page: "home", wardId: null, patientId: null, tab: "sumar", filter: "all", query: "", bed: null, draft: null, view: "paturi", gest: "materiale", medQuery: "", magQuery: "", magClass: "", studyQuery: "", studyKind: "analize", drill: null, period: "azi", staffCat: "medici", deptId: null, labGroup: "uzuale", holdMed: null, doctor: null, compose: false, sheetPage: 0, calOpen: false, calMonth: "", rangeFrom: "", rangeTo: "", zenaOpen: false, zenaThread: [], zenaDraft: "", aiHeard: "", aiReply: "", aiDemo: 0, letterDraft: null, supClass: "Toate", imgKind: "", histOpen: false, histQuery: "", histDoc: "", openAlerts: [], adminIn: true, wardScopeIds: null, hospitalWideAccess: true, apiBoardTotal: 0, platformNote: "", adminTab: "ops", pilotCache: null, flowKind: "patient", wardMenuOpen: false, deptMenuOpen: false, apptDay: "", apptPractitioner: "", admitStep: 0, admitDraft: null, vitalExpand: null, vitalRange: "ore", logScope: "all", logWardId: "", logQuery: "", wardGestId: "materiale", wardGestItemId: "", hrDept: "", hrPersonId: "", hrExpanded: {} };
 let toastTimer;
 let micTimer;
 
@@ -227,6 +228,8 @@ function collectionSnapshot() {
     integrations: state.integrations,
     access: state.access || { accounts: [], currentId: null },
     moduleConfigs: state.moduleConfigs || {},
+    auditLogs: Array.isArray(state.auditLogs) ? state.auditLogs : [],
+    gestMoves: Array.isArray(state.gestMoves) ? state.gestMoves : [],
     synthetic: state.synthetic !== false,
     expectedVersion: state.collectionVersion || undefined
   };
@@ -265,8 +268,12 @@ function applyCollection(doc) {
   if (doc.integrations) state.integrations = doc.integrations;
   if (doc.access) state.access = doc.access;
   if (doc.moduleConfigs) state.moduleConfigs = doc.moduleConfigs;
+  if (Array.isArray(doc.auditLogs)) state.auditLogs = doc.auditLogs;
+  if (Array.isArray(doc.gestMoves)) state.gestMoves = doc.gestMoves;
   state.synthetic = doc.synthetic !== false;
   ensureAccess();
+  ensureAuditLogs();
+  if (ensurePeopleHr()) persist();
 }
 function noms() {
   if (!state.nomenclatoare) state.nomenclatoare = seedNomenclatoare();
@@ -400,6 +407,143 @@ function kitGap(w) {
     if (n && have < need) gaps.push(`${name}: ${have} în stoc, ${need} necesare`);
   });
   return gaps;
+}
+function gestTypesList() {
+  return state.gestTypes || [];
+}
+function gestTypeOf(id) {
+  return gestTypesList().find(t => t.id === id) || null;
+}
+function gestMoves() {
+  if (!Array.isArray(state.gestMoves)) state.gestMoves = [];
+  return state.gestMoves;
+}
+function recordGestMove(entry) {
+  const w = entry.wardId ? (state.wards || []).find(x => x.id === entry.wardId) : ward();
+  const p = entry.patientId ? (w ? findPatient(w, entry.patientId) : null) : null;
+  gestMoves().unshift({
+    id: uid(),
+    at: nowStamp(),
+    who: (currentAccount()?.name || ui.accountName || "Utilizator"),
+    wardId: entry.wardId || w?.id || ui.wardId || null,
+    wardName: entry.wardName || w?.name || "",
+    patientId: entry.patientId || p?.id || null,
+    patientName: entry.patientName || (p ? `${p.last} ${p.first}` : ""),
+    gestId: entry.gestId || "",
+    gestName: entry.gestName || gestTypeOf(entry.gestId)?.name || "",
+    name: entry.name,
+    qty: Number(entry.qty) || 0,
+    unit: entry.unit || "buc",
+    reason: entry.reason || "",
+    source: entry.source || "foaie"
+  });
+  if (state.gestMoves.length > 400) state.gestMoves.length = 400;
+  auditLog({
+    action: "Gestiune",
+    detail: `${entry.name} −${entry.qty} ${entry.unit || "buc"}${entry.reason ? " · " + entry.reason : ""}`,
+    scope: (entry.patientId || p) ? "patient" : "ward",
+    wardId: entry.wardId || w?.id,
+    patientId: entry.patientId || p?.id || null,
+    patientName: entry.patientName || (p ? `${p.last} ${p.first}` : "")
+  });
+}
+/** Scade din gestiunea de spital (liste: lenjerie, dezinfectanți…) după denumire. */
+function deductHospitalGestItem(name, qty, meta = {}) {
+  const needle = String(name || "").trim().toLowerCase();
+  if (!needle || !(qty > 0)) return { ok: false, reason: "Cantitate invalidă." };
+  for (const t of gestTypesList()) {
+    if (t.mode !== "list") continue;
+    const item = (t.items || []).find(i => String(i.name || "").toLowerCase() === needle);
+    if (!item) continue;
+    if (item.qty < qty) return { ok: false, reason: `Stoc insuficient în ${t.name}: ${item.qty} ${item.unit}.` };
+    item.qty -= qty;
+    recordGestMove({
+      gestId: t.id,
+      gestName: t.name,
+      name: item.name,
+      qty,
+      unit: item.unit,
+      source: meta.source || "foaie",
+      reason: meta.reason || "",
+      wardId: meta.wardId,
+      patientId: meta.patientId,
+      patientName: meta.patientName
+    });
+    return { ok: true, type: t, item };
+  }
+  return { ok: false, reason: "not_found" };
+}
+/** Descărcare corelată: stoc secție (materiale/medicamente) + gestiune de spital dacă există aceeași denumire. */
+function correlateGestDischarge({ kind, name, qty, unit, wardId, patientId, patientName, source, reason, medId }) {
+  const w = wardId ? (state.wards || []).find(x => x.id === wardId) : ward();
+  if (!w) return { ok: false, reason: "Secție lipsă." };
+  const q = Math.max(1, Number(qty) || 1);
+  if (kind === "medicamente") {
+    const item = medId ? (w.meds || []).find(m => m.id === medId) : (w.meds || []).find(m => m.name === name);
+    if (!item) return { ok: false, reason: "Medicamentul nu este în magazia secției." };
+    if (item.qty < q) return { ok: false, reason: `Stoc insuficient: ${item.qty} ${item.unit}.` };
+    item.qty -= q;
+    recordGestMove({
+      gestId: "medicamente", gestName: "Medicamente", name: `${item.name} ${item.dose || ""}`.trim(),
+      qty: q, unit: item.unit || unit || "buc", source: source || "foaie", reason,
+      wardId: w.id, patientId, patientName
+    });
+    return { ok: true, item };
+  }
+  if (kind === "materiale" || kind === "stock") {
+    const item = (w.stock || []).find(s => s.name === name);
+    if (!item) return { ok: false, reason: "Materialul nu este în stocul secției." };
+    if (item.qty < q) return { ok: false, reason: `Stoc insuficient: ${item.qty} ${item.unit}.` };
+    item.qty -= q;
+    recordGestMove({
+      gestId: "materiale", gestName: "Materiale", name: item.name,
+      qty: q, unit: item.unit || unit || "buc", source: source || "foaie", reason,
+      wardId: w.id, patientId, patientName
+    });
+    deductHospitalGestItem(item.name, q, { wardId: w.id, patientId, patientName, source: source || "foaie", reason });
+    return { ok: true, item };
+  }
+  // tip listă de spital (lenjerie, dezinfectanți, tipuri noi)
+  const t = gestTypeOf(kind);
+  if (!t || t.mode !== "list") return { ok: false, reason: "Tip de gestiune necunoscut." };
+  const item = (t.items || []).find(i => i.id === name || i.name === name);
+  if (!item) return { ok: false, reason: "Poziția nu există în gestiune." };
+  if (item.qty < q) return { ok: false, reason: `Stoc insuficient în ${t.name}: ${item.qty} ${item.unit}.` };
+  item.qty -= q;
+  recordGestMove({
+    gestId: t.id, gestName: t.name, name: item.name,
+    qty: q, unit: item.unit, source: source || "admin2", reason,
+    wardId: w.id, patientId, patientName
+  });
+  return { ok: true, item, type: t };
+}
+function gestMovesHtml(filterGestId, wardId) {
+  const rows = gestMoves()
+    .filter(m => (!filterGestId || m.gestId === filterGestId) && (!wardId || m.wardId === wardId))
+    .slice(0, 12)
+    .map(m => `<tr>
+      <td class="muted">${esc(fmt(m.at))}</td>
+      <td>${esc(m.name)} <span class="mono">−${m.qty} ${esc(m.unit)}</span></td>
+      <td>${esc(m.wardName || "—")}${m.patientName ? " · " + esc(m.patientName) : ""}</td>
+      <td class="muted">${esc(m.source === "admin2" ? "Admin 2" : m.source === "kit" ? "Kit tură" : m.source === "foaie" ? "Foaie" : esc(m.source || "—"))}${m.reason ? " · " + esc(m.reason) : ""}</td>
+      <td class="muted">${esc(m.who)}</td>
+    </tr>`).join("");
+  if (!rows) return `<p class="muted" style="margin:0">Nicio descărcare încă pe acest tip.</p>`;
+  return `<div class="card-body tight" style="padding:0;margin-top:10px;border:1px solid var(--border);border-radius:12px;overflow:auto;max-height:240px">
+    <table><thead><tr><th>Moment</th><th>Articol</th><th>Unde</th><th>Sursă</th><th>Cine</th></tr></thead><tbody>${rows}</tbody></table>
+  </div>`;
+}
+function wardGestOutOptions(w) {
+  const gestId = ui.wardGestId || "materiale";
+  const t = gestTypeOf(gestId);
+  if (gestId === "materiale" || (t && t.mode === "ward" && gestId === "materiale")) {
+    return (w.stock || []).map(s => `<option value="${esc(s.name)}"${ui.wardGestItemId === s.name ? " selected" : ""}>${esc(s.name)} · ${s.qty} ${esc(s.unit)}</option>`).join("");
+  }
+  if (gestId === "medicamente" || (t && t.mode === "ward" && gestId === "medicamente")) {
+    return (w.meds || []).map(m => `<option value="${esc(m.id)}"${ui.wardGestItemId === m.id ? " selected" : ""}>${esc(m.name)} ${esc(m.dose)} · ${m.qty} ${esc(m.unit)}</option>`).join("");
+  }
+  const items = (t && t.items) || [];
+  return items.map(i => `<option value="${esc(i.id)}"${ui.wardGestItemId === i.id ? " selected" : ""}>${esc(i.name)} · ${i.qty} ${esc(i.unit)}</option>`).join("");
 }
 function dutyName(w, role) { return (w.duty && w.duty[role]) || "—"; }
 
@@ -922,9 +1066,96 @@ function staffSpec() {
     tesa: { label: "Personal TESA", cols: [["last","Nume"],["first","Prenume"],["dept","Departament"],["role","Funcție"],["ext","Interior"],["mail","Email"]] }
   };
 }
+function staffCatLabel(cat) {
+  return (staffSpec()[cat] || {}).label || cat || "Personal";
+}
+function personDept(p) {
+  const f = p.fields || {};
+  return f.ward || f.dept || f.zone || f.loc || "Nesortat";
+}
+function employeeName(p) {
+  const f = p.fields || {};
+  return `${f.last || ""} ${f.first || ""}`.trim() || "Angajat";
+}
+function personRole(p) {
+  const f = p.fields || {};
+  if (p.cat === "medici") return [f.grade, f.spec].filter(Boolean).join(" · ") || "Medic";
+  if (p.cat === "asistenti") return f.skill || "Asistent medical";
+  if (p.cat === "rezidenti") return `Rezident an ${f.year || "—"} · ${f.spec || ""}`.trim();
+  return f.role || staffCatLabel(p.cat);
+}
+function daysUntil(iso) {
+  if (!iso) return null;
+  const t = new Date(iso + (iso.length === 10 ? "T12:00:00" : "")).getTime();
+  if (Number.isNaN(t)) return null;
+  return Math.ceil((t - Date.now()) / 86400000);
+}
+function docStatus(doc) {
+  const d = daysUntil(doc.expiresAt);
+  if (d == null) return "ok";
+  if (d < 0) return "expirat";
+  if (d <= 45) return "expira";
+  return "ok";
+}
+function hrDoc(kind, title, issuedAt, expiresAt, fileName) {
+  return { id: uid(), kind, title, issuedAt, expiresAt: expiresAt || "", fileName: fileName || (title.replace(/\s+/g, "_") + ".pdf"), demo: true };
+}
+function buildHrDossier(p, idx) {
+  const f = p.fields || {};
+  const year = 2018 + (idx % 7);
+  const month = String((idx % 11) + 1).padStart(2, "0");
+  const day = String((idx % 27) + 1).padStart(2, "0");
+  const hiredAt = `${year}-${month}-${day}`;
+  const isTemp = p.cat === "contractual" || p.cat === "voluntari" || p.cat === "rezidenti";
+  const contractTo = isTemp
+    ? (f.until ? f.until.split(".").reverse().join("-") : `${year + 2}-12-31`)
+    : "";
+  const corByCat = { medici: "2211", asistenti: "3221", infirmieri: "5321", brancardieri: "5329", rezidenti: "2211", contractual: "9112", voluntari: "0000", tesa: "2423" };
+  const docs = [
+    hrDoc("buletin", "Copie CI / buletin", hiredAt, `${year + 8}-01-15`, `CI_${f.last || "angajat"}.pdf`),
+    hrDoc("cert_nastere", "Certificat de naștere", hiredAt, "", `CertNastere_${f.last || "angajat"}.pdf`),
+    hrDoc("diploma", "Diplomă / atestat", hiredAt, "", `Diploma_${f.last || "angajat"}.pdf`),
+    hrDoc("contract", `Contract ${f.contract || "CIM"}`, hiredAt, contractTo, `Contract_${f.last || "angajat"}.pdf`),
+    hrDoc("fisa_post", "Fișă de post", hiredAt, `${year + 1}-03-01`, `FisaPost_${f.last || "angajat"}.pdf`),
+    hrDoc("protectia_muncii", "Carte / instruire protecția muncii", `${year}-06-01`, `${year + 1}-06-01`, `ProtectiaMuncii_${f.last || "angajat"}.pdf`),
+    hrDoc("adeverinta", "Adeverință vechime (demo)", `${year}-09-01`, "", `Adeverinta_${f.last || "angajat"}.pdf`)
+  ];
+  return {
+    hiredAt,
+    contractType: p.cat === "contractual" ? "Contract prestări" : p.cat === "voluntari" ? "Acord voluntariat" : (isTemp ? "CIM determinat" : "CIM nedeterminat"),
+    contractNo: f.contract || f.accord || `CIM-${year}-${String(100 + idx).padStart(4, "0")}`,
+    contractFrom: hiredAt,
+    contractTo,
+    corCode: corByCat[p.cat] || "0000",
+    normHours: p.cat === "voluntari" ? "4" : "8",
+    revisalId: `REV-${year}${month}${String(idx + 1).padStart(3, "0")}`,
+    revisalStatus: "Înregistrat",
+    dept: personDept(p),
+    docs,
+    certificates: []
+  };
+}
+function ensurePeopleHr() {
+  let dirty = false;
+  (state.people || []).forEach((p, idx) => {
+    if (p.hr && Array.isArray(p.hr.docs) && p.hr.docs.length) return;
+    p.hr = buildHrDossier(p, idx);
+    dirty = true;
+  });
+  return dirty;
+}
+function canManageHr() {
+  if (isAdmin1()) return true;
+  if (!isAdmin2()) return false;
+  const a = currentAccount();
+  const ids = accountDeptIds(a);
+  const ru = (state.departments || []).find(d => /resurse\s*umane/i.test(d.name || ""));
+  if (ru && ids.includes(ru.id)) return true;
+  return true; // Admin 2 RU / șef: tablou unic pe tot spitalul
+}
 function seedPeople() {
   const row = (cat, fields) => ({ id: uid(), cat, fields });
-  return [
+  const list = [
     row("medici", { last:"Popescu", first:"Ion", code:"P10234", grade:"Primar", spec:"Cardiologie", ward:"Cardiologie", phone:"0259 412 101", mail:"ion.popescu@spital.ro" }),
     row("medici", { last:"Luca", first:"Andrei", code:"P11820", grade:"Specialist", spec:"Cardiologie", ward:"Cardiologie", phone:"0259 412 102", mail:"andrei.luca@spital.ro" }),
     row("medici", { last:"Andrei", first:"Cosmin", code:"P10411", grade:"Primar", spec:"Chirurgie generală", ward:"Chirurgie generală", phone:"0259 412 140", mail:"cosmin.andrei@spital.ro" }),
@@ -958,6 +1189,8 @@ function seedPeople() {
     row("tesa", { last:"Kiss", first:"Enikő", dept:"Achiziții publice", role:"Referent", ext:"160", mail:"eniko.kiss@spital.ro" }),
     row("tesa", { last:"Popescu", first:"Maria", dept:"Juridic", role:"Consilier juridic", ext:"180", mail:"maria.popescu@spital.ro" })
   ];
+  list.forEach((p, i) => { p.hr = buildHrDossier(p, i); });
+  return list;
 }
 function seedDepartments() {
   const row = (name, chief, phone, mission) => ({ id: uid(), name, chief, phone, mission });
@@ -993,7 +1226,8 @@ function navHtml() {
   const head = (label, act, tip) => `<div class="nav-label">${label}${isAdmin1() ? `<button class="nav-plus" type="button" data-act="${act}" title="${esc(tip)}">+</button>` : ""}</div>`;
   const wards = isDeptUser() ? "" : visibleWards().map(w => item("ward", w.id, w.name, "i-bed", false)).join("");
   const gest = isAdmin1() ? (state.gestTypes || []).map(t => item("gest", t.id, t.name, "i-file", ui.page === "gest" && ui.gest === t.id)).join("") : "";
-  const people = isAdmin1() ? Object.entries(staffSpec()).map(([id, meta]) => item("people", id, meta.label, "i-file", ui.page === "people" && ui.staffCat === id)).join("") : "";
+  const showHr = canManageHr();
+  const people = showHr ? Object.entries(staffSpec()).map(([id, meta]) => item("people", id, meta.label, "i-file", ui.page === "people" && ui.staffCat === id)).join("") : "";
   const depts = visibleDepartments().map(d => item("dept", d.id, d.name, "i-grid", ui.page === "dept" && ui.deptId === d.id)).join("");
   const showStructure = isAdmin1() || isAdmin2();
   return `
@@ -1002,7 +1236,9 @@ function navHtml() {
       ${isAdmin1() ? `<button class="nav-item zena-entry${ui.page === "ai-zena" ? " active" : ""}" type="button" data-act="ai-zena">${icon("i-mic")}AI Zena</button>` : ""}
       ${isAdmin1() ? `${head("Secții", "setup", "Adaugă sau configurează o secție")}${wards}` : ""}
       ${isAdmin1() ? `${head("Gestiune", "gest-new", "Adaugă un tip de gestiune")}${gest}` : ""}
-      ${isAdmin1() ? `<div class="nav-label">Personal</div>${people}` : ""}
+      ${showHr ? `<div class="nav-label">Personal</div>
+      <button class="nav-item${ui.page === "hr" ? " active" : ""}" type="button" data-act="hr">${icon("i-grid")}Tablou HR</button>
+      ${people}` : ""}
       ${showStructure ? `${head("Departamente", "dept-new", "Adaugă un departament")}${depts}` : `<div class="nav-label">Departamentul meu</div>${depts}`}
     </div>
     <div class="sidebar-foot">
@@ -1015,6 +1251,40 @@ function navHtml() {
     </div>`;
 }
 
+function ensureAuditLogs() {
+  if (!Array.isArray(state.auditLogs)) state.auditLogs = [];
+  return state.auditLogs;
+}
+function auditActor() {
+  const a = currentAccount();
+  return {
+    who: a?.name || ui.accountName || "Utilizator",
+    role: a?.role || ui.accountRole || "user"
+  };
+}
+function auditLog(entry) {
+  const actor = auditActor();
+  const w = entry.wardId ? (state.wards || []).find(x => x.id === entry.wardId) : ward();
+  const p = entry.patientId && w ? findPatient(w, entry.patientId) : (entry.patientId ? null : patient());
+  const patientId = entry.patientId || (p && p.id) || null;
+  const wardId = entry.wardId || w?.id || ui.wardId || null;
+  const scope = entry.scope || (patientId ? "patient" : wardId ? "ward" : "hospital");
+  ensureAuditLogs().unshift({
+    id: uid(),
+    at: nowStamp(),
+    who: actor.who,
+    role: actor.role,
+    action: entry.action || "modificare",
+    detail: entry.detail || "",
+    scope,
+    wardId,
+    wardName: entry.wardName || w?.name || "",
+    patientId,
+    patientName: entry.patientName || (p ? `${p.last} ${p.first}` : ""),
+    fileNo: entry.fileNo || p?.fileNo || ""
+  });
+  if (state.auditLogs.length > 500) state.auditLogs.length = 500;
+}
 function topHtml(title, crumb, action, back) {
   const today = new Date().toLocaleDateString("ro-RO", { weekday: "long", day: "numeric", month: "long" });
   return `<header class="topbar">${back || ""}<div class="title"><h1>${esc(title)}</h1><div class="crumb">${esc(crumb)}</div></div>
@@ -1246,10 +1516,22 @@ function bedHtml(w, bedNo) {
   const visible = matches(p);
   return `<button class="bed occ doc-tone${visible ? "" : " dim"}" type="button" data-act="patient" data-id="${esc(w.id)}" data-pid="${esc(p.id)}" style="${doctorToneStyle(pal)}">${head}<span class="who">${esc(p.last)} ${esc(p.first)}</span><span class="meta">${esc(p.dxCode)} · ${esc(doc)}</span></button>`;
 }
+function canManageWard(w) {
+  if (!w) return false;
+  if (isAdmin1()) return true;
+  const a = currentAccount();
+  if (!a) return isAdmin2();
+  if (a.role === "admin2") {
+    if (w.chief && a.name && w.chief.toLowerCase() === a.name.toLowerCase()) return true;
+    if ((w.physicians || []).some(n => String(n).toLowerCase() === String(a.name || "").toLowerCase())) return true;
+    return isAdmin2();
+  }
+  return false;
+}
 function clinicActions() {
-  const menuViews = ["magazie", "garzi", "lab", "rapoarte", "statistica", "programari"];
+  const menuViews = ["magazie", "garzi", "lab", "rapoarte", "statistica", "programari", "admin"];
   const menuOn = menuViews.includes(ui.view);
-  const item = (id, label) => `<button type="button" class="ward-menu-item${ui.view === id ? " on" : ""}" data-act="view" data-id="${id}">${label}</button>`;
+  const item = (id, label, extraClass) => `<button type="button" class="ward-menu-item${extraClass ? " " + extraClass : ""}${ui.view === id ? " on" : ""}" data-act="view" data-id="${id}">${label}</button>`;
   const open = ui.wardMenuOpen ? " open" : "";
   return `<button class="btn${ui.view === "saloane" ? " on" : ""}" type="button" data-act="view" data-id="saloane">Saloane</button>
     <button class="btn btn-primary" type="button" data-act="admit">Internare</button>
@@ -1264,8 +1546,71 @@ function clinicActions() {
         ${item("lab", "Laborator")}
         ${item("rapoarte", "Rapoarte")}
         ${item("statistica", "Statistică")}
+        <div class="ward-menu-sep" role="separator"></div>
+        ${item("admin", "Admin", "ward-menu-admin")}
       </div>
     </div>`;
+}
+function deptActions(dept) {
+  if (!dept) return "";
+  const open = ui.deptMenuOpen ? " open" : "";
+  const item = (act, id, label, extraClass) =>
+    `<button type="button" class="ward-menu-item${extraClass ? " " + extraClass : ""}" data-act="${act}" data-id="${esc(id || "")}">${label}</button>`;
+  return `<div class="ward-menu${open}">
+      <button class="btn ward-menu-toggle" type="button" data-act="dept-menu" aria-expanded="${ui.deptMenuOpen ? "true" : "false"}" aria-label="Meniu departament" title="Meniu departament">
+        <span class="burger" aria-hidden="true"><i></i><i></i><i></i></span>
+      </button>
+      <div class="ward-menu-panel" role="menu">
+        ${item("dept", dept.id, "Date generale")}
+        ${item("dept-config", dept.id, "Structură câmpuri")}
+        ${item("dept-import", dept.id, "Import")}
+        <div class="ward-menu-sep" role="separator"></div>
+        ${item("dept-admin", dept.id, "Admin", "ward-menu-admin")}
+      </div>
+    </div>`;
+}
+function pageWardAdmin(w) {
+  const can = canManageWard(w);
+  const key = "ward:" + (w.id || deptCode(w.name));
+  ensureModuleConfig(key, w.name);
+  const fields = ((state.moduleConfigs[key] || {}).fields || []).filter(f => f.enabled !== false);
+  const staffN = (w.staff || []).length;
+  const medicsN = medics(w).length;
+  const gestOpts = gestTypesList().map(t => `<option value="${esc(t.id)}"${(ui.wardGestId || "materiale") === t.id ? " selected" : ""}>${esc(t.name)}</option>`).join("");
+  const itemOpts = wardGestOutOptions(w);
+  const gestOut = can ? `<div class="card" style="margin-bottom:12px"><div class="card-head"><h2>Descărcare directă gestiune</h2><span class="sub">fără foaie pacient</span></div><div class="card-body">
+      <p class="muted" style="margin-top:0">Când articolul nu e pe foaia pacientului (lenjerie, dezinfectanți, consum de secție), Admin 2 îl descarcă aici — scade automat în Gestiune.</p>
+      <div class="fields">
+        <div><label class="lbl" for="wg-gest">Gestiune</label><select id="wg-gest" data-act="ward-gest-type">${gestOpts}</select></div>
+        <div><label class="lbl" for="wg-item">Articol</label><select id="wg-item">${itemOpts || `<option value="">Nicio poziție</option>`}</select></div>
+        <div><label class="lbl" for="wg-qty">Cantitate</label><input id="wg-qty" type="number" min="1" value="1"></div>
+        <div class="span-2"><label class="lbl" for="wg-reason">Motiv</label><input id="wg-reason" type="text" placeholder="Ex. schimb lenjerie salon 2, curățenie, consum secție"></div>
+      </div>
+      <div class="form-actions" style="justify-content:flex-start"><button class="btn btn-primary" type="button" data-act="ward-gest-out">Descarcă în gestiune</button></div>
+      ${gestMovesHtml(ui.wardGestId || "materiale", w.id)}
+    </div></div>` : "";
+  return `<p class="lead">Admin secție — ${can ? "ca Admin 2 puteți configura doar această secție și descărca direct în gestiune." : "doar Admin 1 / Admin 2 pot modifica structura."}</p>
+    <div class="card" style="margin-bottom:12px"><div class="card-head"><h2>${esc(w.name)}</h2><span class="sub">Admin 2 · secție</span></div><div class="card-body">
+      <div class="fields">
+        <div><label class="lbl" for="wa-chief">Șef secție (Admin 2)</label><input id="wa-chief" type="text" value="${esc(w.chief || "")}" ${can ? "" : "disabled"}></div>
+        <div><label class="lbl" for="wa-nurse">Asistent șef</label><input id="wa-nurse" type="text" value="${esc(w.nurse || "")}" ${can ? "" : "disabled"}></div>
+        <div class="span-2"><label class="lbl">Medici pe listă</label><div class="muted">${medicsN ? medics(w).map(esc).join(", ") : "Niciun medic — adăugați din Gărzi / personal"}</div></div>
+      </div>
+      ${can ? `<div class="form-actions" style="justify-content:flex-start"><button class="btn btn-primary" type="button" data-act="ward-admin-save">Salvează datele secției</button></div>` : ""}
+    </div></div>
+    ${gestOut}
+    <div class="card" style="margin-bottom:12px"><div class="card-head"><h2>Interfața secției</h2><span class="sub">${fields.length} câmpuri active</span></div><div class="card-body">
+      <p class="muted" style="margin-top:0">Adăugați sau ștergeți câmpuri pe ecranul secției — fără a atinge restul spitalului.</p>
+      <ul class="muted" style="margin:0 0 12px;padding-left:18px">${fields.slice(0, 8).map(f => `<li>${esc(f.label)} <span class="mono">(${esc(f.key)})</span></li>`).join("") || "<li>Niciun câmp încă</li>"}</ul>
+      <div class="form-actions" style="justify-content:flex-start;flex-wrap:wrap">
+        <button class="btn btn-primary" type="button" data-act="ward-config" data-id="${esc(w.id)}">Configurează câmpurile</button>
+        <button class="btn" type="button" data-act="view" data-id="garzi">Personal și gardă</button>
+        <button class="btn" type="button" data-act="setup">Paturi / structură</button>
+      </div>
+    </div></div>
+    <div class="card"><div class="card-head"><h2>Rezumat</h2></div><div class="card-body">
+      <p style="margin:0">${bedCount(w)} paturi · ${staffN} persoane în personal · ${occCount(w)} internați acum</p>
+    </div></div>`;
 }
 function rosterCards(w) {
   const all = occupied(w);
@@ -1290,7 +1635,7 @@ function boardHead(w) {
 }
 function pageWard() {
   const w = ward();
-  const view = ["magazie", "statistica", "saloane", "garzi", "lab", "rapoarte", "programari"].includes(ui.view) ? ui.view : "paturi";
+  const view = ["magazie", "statistica", "saloane", "garzi", "lab", "rapoarte", "programari", "admin"].includes(ui.view) ? ui.view : "paturi";
   const back = `<button class="back" type="button" data-act="home" title="Înapoi la situație">←</button>`;
   if (view === "programari") {
     return topHtml(w.name, "Programări Ambulatoriu · HL7 SIU", clinicActions(), back) + `<div class="content">${appointmentsHtml({ wardId: w.apiId, wardName: w.name, admin: false })}</div>`;
@@ -1303,6 +1648,9 @@ function pageWard() {
   }
   if (view === "rapoarte") {
     return topHtml(w.name, "Rapoarte multi-format", clinicActions(), back) + `<div class="content">${wardReportsHtml(w)}</div>`;
+  }
+  if (view === "admin") {
+    return topHtml(w.name, "Admin secție · Admin 2", clinicActions(), back) + `<div class="content">${pageWardAdmin(w)}</div>`;
   }
   if (view === "paturi" || view === "saloane") {
     const body = view === "saloane" ? saloaneHtml(w) : paturiHtml(w);
@@ -1996,31 +2344,7 @@ function summaryHtml(w, p) {
   const meds = (p.meds || []).map(m => `<li>${esc(m.name)} ${esc(m.dose)}${m.route ? " · " + esc(m.route) : ""}${m.schedule ? " · " + esc(m.schedule) : ""}</li>`).join("") || "<li>Nicio prescriere.</li>";
   const vitals = (p.vitals || []).slice().reverse().map(v => `<tr><td class="muted">${esc(fmt(v.at))}</td><td>${esc(v.ta)}</td><td class="${Number(v.av) > 110 || Number(v.av) <= 50 ? "danger" : ""}">${esc(v.av)}</td><td class="${Number(v.rr) >= 24 || Number(v.rr) <= 10 ? "danger" : ""}">${esc(v.rr || "—")}</td><td>${esc(v.temp)}</td><td class="${Number(v.spo2) < 94 ? "danger" : ""}">${esc(v.spo2)}</td></tr>`).join("");
   const notes = (p.notes || []).slice().sort((a, b) => b.at.localeCompare(a.at)).slice(0, 3).map(n => `<p><strong>${esc(n.author)}</strong> · <span class="muted">${esc(fmt(n.at))}</span><br>${esc(n.text)}</p>`).join("");
-  return `<div class="split trio">
-    <div class="card"><div class="card-head"><h2>Internare</h2></div><div class="card-body"><dl class="kv">
-      <dt>Loc</dt><dd>${esc(place)}</dd>
-      <dt>De gardă</dt><dd>${esc(boardDoctor(w, p))}</dd>
-      <dt>Medic curant</dt><dd>${esc(p.physician)}</dd>
-      <dt>Tip</dt><dd>${esc(p.type)}</dd>
-      <dt>Data</dt><dd>${esc(fmt(p.admitted))}</dd>
-      <dt>Zile</dt><dd>${stayDays(p.admitted)}</dd>
-      <dt>CNP</dt><dd class="mono">${esc(p.cnp)}</dd>
-      <dt>Asigurare</dt><dd>${p.insured ? esc(p.casa) : "Neasigurat"}</dd>
-      <dt>Alergii</dt><dd>${esc(p.allergies)}</dd>
-      <dt>Grupa</dt><dd>${esc(p.blood || "—")}</dd>
-      <dt>Adresă</dt><dd>${esc(p.address || "—")}</dd>
-      <dt>Telefon</dt><dd>${esc(p.phone)}</dd>
-      <dt>Aparținător</dt><dd>${esc(p.kinName || "—")}${p.kinWho ? " · " + esc(p.kinWho) : ""}${p.kinPhone ? " · " + esc(p.kinPhone) : ""}</dd>
-      <dt>Trimis de</dt><dd>${esc(p.referrer || "—")}</dd>
-      <dt>Constituție</dt><dd>${p.bodyKg ? esc(String(p.bodyKg)) + " kg" : "—"} · ${p.heightCm ? esc(String(p.heightCm)) + " cm" : "—"}</dd>
-      <dt>Acord internare</dt><dd>${p.consentAdmit ? "Da" : "Nu"}</dd>
-      <dt>Acord procedură</dt><dd>${p.consentProc ? "Da" : "Nu"}</dd>
-      <dt>Diagnostic internare</dt><dd>${esc(p.dxAdmit || p.dx || "—")}</dd>
-      <dt>Diagnostic de lucru</dt><dd>${esc(p.dx || "—")}${p.dxCode ? " · " + esc(p.dxCode) : ""}</dd>
-      <dt>Secundare</dt><dd>${esc(p.secondary || "—")}</dd>
-      <dt>Motiv</dt><dd>${esc(p.reason || "—")}</dd>
-      <dt>Antecedente</dt><dd>${esc(p.antecedents || "—")}</dd>
-    </dl>${p.bed ? `<form class="fields" style="margin-top:14px" onsubmit="return false">
+  const admitForm = p.bed ? `<div class="card-body" id="sum-admit-edit"><form class="fields" onsubmit="return false">
       <div class="span-2"><label class="lbl" for="ch-dx">Diagnostic de lucru</label><input id="ch-dx" type="text" value="${esc(p.dx || "")}"></div>
       <div class="span-2"><label class="lbl" for="ch-sec">Diagnostice secundare</label><input id="ch-sec" type="text" value="${esc(p.secondary || "")}" placeholder="Cod și denumire, separate prin virgulă"></div>
       <div class="span-2"><label class="lbl" for="ch-reason">Motivul internării</label><textarea id="ch-reason">${esc(p.reason || "")}</textarea></div>
@@ -2030,12 +2354,53 @@ function summaryHtml(w, p) {
       <div class="span-2"><label class="check"><input id="ch-ca" type="checkbox"${p.consentAdmit ? " checked" : ""}> Acord pentru internare</label></div>
       <div class="span-2"><label class="check"><input id="ch-cp" type="checkbox"${p.consentProc ? " checked" : ""}> Acord pentru procedură</label></div>
       <div class="span-2 form-actions"><button class="btn btn-primary" type="button" data-act="save-chart">Salvează pe foaie</button></div>
-    </form>` : ""}</div></div>
-    <div class="card"><div class="card-head"><h2>Constante în foaie</h2></div><div class="card-body tight"><table><thead><tr><th>Moment</th><th>TA</th><th>AV</th><th>FR</th><th>Temp.</th><th>SpO₂</th></tr></thead><tbody>${vitals || `<tr><td colspan="6" class="muted" style="padding:16px">Nicio înregistrare.</td></tr>`}</tbody></table></div><div class="card-body"><div class="section-title">Evoluție recentă</div>${notes || `<p class="muted">Nicio evoluție.</p>`}</div></div>
-    <div class="card"><div class="card-head"><h2>Plan</h2></div><div class="card-body">
-      <div class="section-title">Medicație</div><ul>${meds}</ul>
-      <div class="section-title">Investigații</div><ul>${studies}</ul>
-    </div></div>
+    </form></div>` : "";
+  return `<div class="split trio">
+    <div class="card sum-nav-card">
+      <div class="sum-nav-hit" data-act="sum-jump" data-tab="sumar" data-focus="sum-admit-edit" role="button" tabindex="0" aria-label="Deschide completarea internării">
+        <div class="card-head"><h2>Internare</h2><span class="sub sum-nav-hint">atinge pentru completare</span></div>
+        <div class="card-body"><dl class="kv">
+          <dt>Loc</dt><dd>${esc(place)}</dd>
+          <dt>De gardă</dt><dd>${esc(boardDoctor(w, p))}</dd>
+          <dt>Medic curant</dt><dd>${esc(p.physician)}</dd>
+          <dt>Tip</dt><dd>${esc(p.type)}</dd>
+          <dt>Data</dt><dd>${esc(fmt(p.admitted))}</dd>
+          <dt>Zile</dt><dd>${stayDays(p.admitted)}</dd>
+          <dt>CNP</dt><dd class="mono">${esc(p.cnp)}</dd>
+          <dt>Asigurare</dt><dd>${p.insured ? esc(p.casa) : "Neasigurat"}</dd>
+          <dt>Alergii</dt><dd>${esc(p.allergies)}</dd>
+          <dt>Grupa</dt><dd>${esc(p.blood || "—")}</dd>
+          <dt>Adresă</dt><dd>${esc(p.address || "—")}</dd>
+          <dt>Telefon</dt><dd>${esc(p.phone)}</dd>
+          <dt>Aparținător</dt><dd>${esc(p.kinName || "—")}${p.kinWho ? " · " + esc(p.kinWho) : ""}${p.kinPhone ? " · " + esc(p.kinPhone) : ""}</dd>
+          <dt>Trimis de</dt><dd>${esc(p.referrer || "—")}</dd>
+          <dt>Constituție</dt><dd>${p.bodyKg ? esc(String(p.bodyKg)) + " kg" : "—"} · ${p.heightCm ? esc(String(p.heightCm)) + " cm" : "—"}</dd>
+          <dt>Acord internare</dt><dd>${p.consentAdmit ? "Da" : "Nu"}</dd>
+          <dt>Acord procedură</dt><dd>${p.consentProc ? "Da" : "Nu"}</dd>
+          <dt>Diagnostic internare</dt><dd>${esc(p.dxAdmit || p.dx || "—")}</dd>
+          <dt>Diagnostic de lucru</dt><dd>${esc(p.dx || "—")}${p.dxCode ? " · " + esc(p.dxCode) : ""}</dd>
+          <dt>Secundare</dt><dd>${esc(p.secondary || "—")}</dd>
+          <dt>Motiv</dt><dd>${esc(p.reason || "—")}</dd>
+          <dt>Antecedente</dt><dd>${esc(p.antecedents || "—")}</dd>
+        </dl></div>
+      </div>
+      ${admitForm}
+    </div>
+    <div class="card sum-nav-card sum-nav-full" data-act="sum-jump" data-tab="monitor" data-compose="1" role="button" tabindex="0" aria-label="Deschide monitorizarea constantelor">
+      <div class="card-head"><h2>Constante în foaie</h2><span class="sub sum-nav-hint">atinge pentru completare</span></div>
+      <div class="card-body tight"><table><thead><tr><th>Moment</th><th>TA</th><th>AV</th><th>FR</th><th>Temp.</th><th>SpO₂</th></tr></thead><tbody>${vitals || `<tr><td colspan="6" class="muted" style="padding:16px">Nicio înregistrare.</td></tr>`}</tbody></table></div>
+      <div class="card-body"><div class="section-title">Evoluție recentă</div>${notes || `<p class="muted">Nicio evoluție.</p>`}
+        <button class="btn btn-sm sum-nav-sub" type="button" data-act="sum-jump" data-tab="evolutie" data-compose="1">Deschide evoluția</button>
+      </div>
+    </div>
+    <div class="card sum-nav-card sum-nav-full" data-act="sum-jump" data-tab="medicatie" data-compose="1" role="button" tabindex="0" aria-label="Deschide planul de medicație">
+      <div class="card-head"><h2>Plan</h2><span class="sub sum-nav-hint">atinge pentru completare</span></div>
+      <div class="card-body">
+        <div class="section-title">Medicație</div><ul>${meds}</ul>
+        <div class="section-title">Investigații</div><ul>${studies}</ul>
+        <button class="btn btn-sm sum-nav-sub" type="button" data-act="sum-jump" data-tab="analize" data-compose="1">Deschide investigațiile</button>
+      </div>
+    </div>
   </div>`;
 }
 function evolutionHtml(w, p) {
@@ -2558,30 +2923,156 @@ function pageGest() {
   ui.gest = type.id;
   if (type.mode === "list") return listGest(type);
   const w = adminWard();
-  return topHtml(type.name, "Gestiune · " + (w ? w.name : ""), "") + `<div class="content"><p class="lead">Stocul secției. Adăugarea și ștergerea se fac aici. Pe secție se doar consumă.</p>${wardSwitch()}${gestBody(w)}</div>`;
+  return topHtml(type.name, "Gestiune · " + (w ? w.name : ""), "") + `<div class="content"><p class="lead">Stocul secției, corelat cu magazia. Ce se descarcă pe foaie sau din Admin 2 scade automat aici.</p>${wardSwitch()}${gestBody(w)}
+    <div class="card" style="margin-top:12px"><div class="card-head"><h2>Mișcări recente</h2><span class="sub">${esc(type.name)}</span></div><div class="card-body">${gestMovesHtml(type.id, w?.id)}</div></div>
+  </div>`;
 }
 function listGest(type) {
-  const rows = (type.items || []).map(item => `<tr><td class="name">${esc(item.name)}</td><td class="mono">${item.qty}</td><td>${esc(item.unit)}</td><td><button class="btn btn-sm" type="button" data-act="del-gest-item" data-gid="${esc(item.id)}">Șterge</button></td></tr>`).join("");
-  return topHtml(type.name, "Gestiune de spital", "") + `<div class="content"><p class="lead">Registru de spital pentru acest tip de gestiune. Se adaugă și se șterge de aici.</p>
+  const rows = (type.items || []).map(item => `<tr class="${item.qty < (item.min || 5) ? "low" : ""}"><td class="name">${esc(item.name)}</td><td class="mono">${item.qty}</td><td>${esc(item.unit)}</td><td><button class="btn btn-sm" type="button" data-act="del-gest-item" data-gid="${esc(item.id)}">Șterge</button></td></tr>`).join("");
+  return topHtml(type.name, "Gestiune de spital", "") + `<div class="content"><p class="lead">Registru de spital. Descărcările de pe secții (Admin 2 sau foaie, dacă denumirea coincide) scad automat cantitatea.</p>
     <div class="card"><div class="card-head"><h2>${esc(type.name)}</h2></div><div class="card-body tight"><table><thead><tr><th>Denumire</th><th>Cantitate</th><th>UM</th><th></th></tr></thead><tbody>${rows || `<tr><td colspan="4" class="muted" style="padding:16px">Nicio poziție.</td></tr>`}</tbody></table></div>
     <div class="card-body"><div class="fields">
       <div><label class="lbl" for="gi-name">Denumire</label><input id="gi-name" type="text"></div>
       <div><label class="lbl" for="gi-qty">Cantitate</label><input id="gi-qty" type="number" min="1" value="10"></div>
       <div><label class="lbl" for="gi-unit">UM</label><input id="gi-unit" type="text" value="buc"></div>
-    </div><div class="form-actions"><button class="btn btn-primary" type="button" data-act="add-gest-item">Adaugă</button></div></div></div></div>`;
+    </div><div class="form-actions"><button class="btn btn-primary" type="button" data-act="add-gest-item">Adaugă</button></div>
+    ${gestMovesHtml(type.id)}
+    </div></div></div>`;
 }
 function pageGestNew() {
   return topHtml("Tip nou de gestiune", "Gestiune", `<button class="btn" type="button" data-act="home">Renunță</button><button class="btn btn-primary" type="button" data-act="save-gest-type">Creează</button>`) + `<div class="content"><div class="card"><div class="card-body"><div class="fields"><div class="span-2"><label class="lbl" for="gt-name">Denumire</label><input id="gt-name" type="text" placeholder="Alimentație, lenjerie, dispozitive"></div></div></div></div></div>`;
 }
 function pagePeople() {
+  if (!canManageHr()) {
+    return topHtml("Acces restricționat", "Personal", `<button class="btn" type="button" data-act="home">Înapoi</button>`) +
+      `<div class="content"><div class="card"><div class="card-body"><p class="muted">Doar Admin 1 / Admin 2 (RU) pot gestiona personalul.</p></div></div></div>`;
+  }
   const spec = staffSpec()[ui.staffCat] || staffSpec().medici;
   const rows = (state.people || []).filter(p => p.cat === ui.staffCat);
   const head = spec.cols.map(([, label]) => `<th>${label}</th>`).join("");
-  const body = rows.map(p => `<tr>${spec.cols.map(([key]) => `<td>${esc(p.fields[key] || "")}</td>`).join("")}<td><button class="btn btn-sm" type="button" data-act="del-person" data-pid="${esc(p.id)}">Șterge</button></td></tr>`).join("");
+  const body = rows.map(p => `<tr>${spec.cols.map(([key]) => `<td>${esc(p.fields[key] || "")}</td>`).join("")}<td><button class="btn btn-sm" type="button" data-act="hr-dosar" data-id="${esc(p.id)}">Dosar</button> <button class="btn btn-sm" type="button" data-act="del-person" data-pid="${esc(p.id)}">Șterge</button></td></tr>`).join("");
   const fields = spec.cols.map(([key, label]) => `<div><label class="lbl" for="pf-${key}">${label}</label><input id="pf-${key}" type="text"></div>`).join("");
-  return topHtml(spec.label, "Registru de personal", "") + `<div class="content"><p class="lead">Fișele sunt ale spitalului. Se adaugă și se șterg cu datele proprii fiecărei categorii.</p>
+  return topHtml(spec.label, "Registru de personal", `<button class="btn" type="button" data-act="hr">Tablou HR</button>`) + `<div class="content"><p class="lead">Registru pe tip de personal. Deschideți Tablou HR pentru vederea pe departamente, dosare și REVISAL.</p>
     <div class="card"><div class="card-head"><h2>${esc(spec.label)}</h2><span class="sub">${rows.length} fișe</span></div><div class="card-body tight"><table><thead><tr>${head}<th></th></tr></thead><tbody>${body}</tbody></table></div>
     <div class="card-body"><div class="fields">${fields}</div><div class="form-actions"><button class="btn btn-primary" type="button" data-act="add-person">Adaugă fișa</button></div></div></div></div>`;
+}
+function hrDocBadge(status) {
+  if (status === "expirat") return `<span class="badge bad">Expirat</span>`;
+  if (status === "expira") return `<span class="badge warn">Expiră curând</span>`;
+  return `<span class="badge ok">Valabil</span>`;
+}
+function personDosarHtml(p) {
+  if (!p) return "";
+  ensurePeopleHr();
+  const hr = p.hr || buildHrDossier(p, 0);
+  const docs = (hr.docs || []).map(d => {
+    const st = docStatus(d);
+    return `<tr>
+      <td class="name">${esc(d.title)}</td>
+      <td class="muted mono">${esc(d.fileName)}</td>
+      <td class="muted">${esc(fmtDay(d.issuedAt) || "—")}</td>
+      <td class="muted">${d.expiresAt ? esc(fmtDay(d.expiresAt)) : "—"}</td>
+      <td>${hrDocBadge(st)}</td>
+      <td><button class="btn btn-sm" type="button" data-act="hr-open-doc" data-pid="${esc(p.id)}" data-did="${esc(d.id)}">Deschide PDF</button></td>
+    </tr>`;
+  }).join("");
+  const certs = (hr.certificates || []).slice().reverse().map(c =>
+    `<li><button type="button" class="linkish" data-act="hr-open-cert" data-pid="${esc(p.id)}" data-cid="${esc(c.id)}">${esc(c.title)}</button> <span class="muted">· ${esc(fmt(c.at))} · ${esc(c.number)}</span></li>`
+  ).join("") || `<li class="muted">Nicio adeverință emisă încă.</li>`;
+  return `<div class="card hr-dosar" style="margin-top:12px"><div class="card-head"><h2>Dosar angajat · ${esc(employeeName(p))}</h2>
+      <span class="sub">${esc(staffCatLabel(p.cat))} · ${esc(hr.dept || personDept(p))}</span>
+      <button class="btn btn-sm" type="button" data-act="hr-dosar-close">Închide</button></div>
+    <div class="card-body">
+      <div class="fields" style="margin-bottom:12px">
+        <div><label class="lbl">Angajat la</label><div>${esc(fmtDay(hr.hiredAt))}</div></div>
+        <div><label class="lbl">Tip contract</label><div>${esc(hr.contractType)}</div></div>
+        <div><label class="lbl">Nr. contract</label><div class="mono">${esc(hr.contractNo)}</div></div>
+        <div><label class="lbl">Perioadă</label><div>${esc(fmtDay(hr.contractFrom))}${hr.contractTo ? " → " + esc(fmtDay(hr.contractTo)) : " · nedeterminat"}</div></div>
+        <div><label class="lbl">COR (REVISAL)</label><div class="mono">${esc(hr.corCode)}</div></div>
+        <div><label class="lbl">Normă</label><div>${esc(hr.normHours)} h/zi</div></div>
+        <div><label class="lbl">ID REVISAL</label><div class="mono">${esc(hr.revisalId)}</div></div>
+        <div><label class="lbl">Status REVISAL</label><div>${esc(hr.revisalStatus || "Înregistrat")}</div></div>
+        <div class="span-2"><label class="lbl">Funcție</label><div>${esc(personRole(p))}</div></div>
+      </div>
+      <div class="section-title">Documente dosar</div>
+      <div class="card-body tight" style="padding:0;border:1px solid var(--border);border-radius:12px;overflow:auto">
+        <table><thead><tr><th>Document</th><th>Fișier</th><th>Emis</th><th>Expiră</th><th>Stare</th><th></th></tr></thead><tbody>${docs}</tbody></table>
+      </div>
+      <div class="section-title" style="margin-top:14px">Adeverințe</div>
+      <ul style="margin:0 0 10px;padding-left:18px">${certs}</ul>
+      <div class="form-actions" style="justify-content:flex-start;flex-wrap:wrap">
+        <button class="btn btn-primary" type="button" data-act="hr-adeverinta" data-id="${esc(p.id)}" data-kind="vechime">Emite adeverință vechime</button>
+        <button class="btn" type="button" data-act="hr-adeverinta" data-id="${esc(p.id)}" data-kind="angajat">Emite adeverință angajat</button>
+        <button class="btn" type="button" data-act="hr-adeverinta" data-id="${esc(p.id)}" data-kind="venit">Emite adeverință venit (demo)</button>
+      </div>
+    </div></div>`;
+}
+function pageHrDashboard() {
+  if (!canManageHr()) {
+    return topHtml("Acces restricționat", "Personal", `<button class="btn" type="button" data-act="home">Înapoi</button>`) +
+      `<div class="content"><div class="card"><div class="card-body"><p class="muted">Tabloul HR este pentru Admin 1 și Admin 2 (Resurse umane).</p></div></div></div>`;
+  }
+  ensurePeopleHr();
+  const people = state.people || [];
+  const byDept = {};
+  people.forEach(p => {
+    const d = (p.hr && p.hr.dept) || personDept(p);
+    (byDept[d] = byDept[d] || []).push(p);
+  });
+  const depts = Object.keys(byDept).sort((a, b) => a.localeCompare(b, "ro"));
+  const filter = ui.hrDept || "";
+  const visibleDepts = filter ? depts.filter(d => d === filter) : depts;
+  const expiring = people.filter(p => (p.hr?.docs || []).some(d => {
+    const st = docStatus(d);
+    return st === "expira" || st === "expirat";
+  })).length;
+  const byCat = Object.keys(staffSpec()).map(cat => {
+    const n = people.filter(p => p.cat === cat).length;
+    return n ? `<span class="hr-pill">${esc(staffCatLabel(cat))} <b>${n}</b></span>` : "";
+  }).join("");
+  const open = ui.hrPersonId ? people.find(p => p.id === ui.hrPersonId) : null;
+  const expanded = ui.hrExpanded || {};
+  const blocks = visibleDepts.map(dept => {
+    const list = byDept[dept];
+    const isOpen = expanded[dept] !== false; // default expanded
+    const rows = list.map(p => {
+      const hr = p.hr || {};
+      const bad = (hr.docs || []).filter(d => docStatus(d) !== "ok").length;
+      return `<tr>
+        <td class="name">${esc(employeeName(p))}</td>
+        <td>${esc(staffCatLabel(p.cat))}</td>
+        <td>${esc(personRole(p))}</td>
+        <td class="muted">${esc(fmtDay(hr.hiredAt) || "—")}</td>
+        <td class="muted">${esc(hr.contractType || "—")}${hr.contractTo ? `<div class="mono">→ ${esc(fmtDay(hr.contractTo))}</div>` : ""}</td>
+        <td class="mono">${esc(hr.revisalId || "—")}</td>
+        <td>${bad ? `<span class="badge warn">${bad} doc</span>` : `<span class="badge ok">OK</span>`}</td>
+        <td><button class="btn btn-sm btn-primary" type="button" data-act="hr-dosar" data-id="${esc(p.id)}">Dosar angajat</button></td>
+      </tr>`;
+    }).join("");
+    return `<div class="card hr-dept" style="margin-bottom:12px">
+      <button type="button" class="hr-dept-toggle" data-act="hr-toggle-dept" data-id="${esc(dept)}" aria-expanded="${isOpen ? "true" : "false"}">
+        <span><b>${esc(dept)}</b> <span class="muted">${list.length} angajați</span></span>
+        <span class="hr-chevron">${isOpen ? "▾" : "▸"}</span>
+      </button>
+      ${isOpen ? `<div class="card-body tight"><table><thead><tr><th>Nume</th><th>Tip</th><th>Funcție</th><th>Angajat</th><th>Contract</th><th>REVISAL</th><th>Docs</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : ""}
+    </div>`;
+  }).join("");
+  const chips = [`<button type="button" class="hr-chip${!filter ? " on" : ""}" data-act="hr-filter-dept" data-id="">Toate (${people.length})</button>`]
+    .concat(depts.map(d => `<button type="button" class="hr-chip${filter === d ? " on" : ""}" data-act="hr-filter-dept" data-id="${esc(d)}">${esc(d)} (${byDept[d].length})</button>`))
+    .join("");
+  return topHtml("Tablou personal HR", "Admin 2 · Resurse umane · REVISAL", `<button class="btn" type="button" data-act="people" data-id="medici">Registre pe tip</button>`) + `<div class="content">
+    <p class="lead">Un singur dashboard pentru tot personalul spitalului: pe departamente / secții, cu dosar angajat (diplomă, CI, certificat naștere, contract, fișă de post, protecția muncii) și emitere automată de adeverințe.</p>
+    <div class="hr-kpis">
+      <article><em>Angajați</em><b>${people.length}</b></article>
+      <article><em>Departamente</em><b>${depts.length}</b></article>
+      <article><em>Doc. de urmărit</em><b class="${expiring ? "danger" : ""}">${expiring}</b></article>
+      <article><em>REVISAL</em><b>OK</b><span class="muted">interconectare demo</span></article>
+    </div>
+    <div class="hr-cats">${byCat}</div>
+    <div class="hr-chips">${chips}</div>
+    ${open ? personDosarHtml(open) : ""}
+    ${blocks || `<div class="card"><div class="card-body"><p class="muted">Niciun angajat în registru.</p></div></div>`}
+  </div>`;
 }
 function pageDept() {
   const dept = (state.departments || []).find(d => d.id === ui.deptId);
@@ -2605,8 +3096,10 @@ function pageDeptForm(dept) {
   const admin2 = dept ? (state.access?.accounts || []).find(a => a.id === dept.admin2Id) : null;
   const users = dept ? (state.access?.accounts || []).filter(a => a.role === "user" && accountDeptIds(a).includes(dept.id)) : [];
   const lock = !canEdit ? " disabled" : "";
-  return topHtml(title, isAdmin2() ? "Departamentul meu" : "Departamente", `${del}${cfg}${canEdit ? `<button class="btn btn-primary" type="button" data-act="save-dept">Salvează</button>` : ""}`) + `<div class="content">
-    <p class="lead">${canFields ? "Ca Admin 2 puteți adăuga sau șterge câmpuri din interfața departamentului, fără a atinge restul spitalului." : isDeptUser() ? "Cont de user: vedeți și completați datele departamentului. Structura câmpurilor o schimbă doar Admin 2." : "Departamentele administrative: structură de câmpuri + import Excel/CSV. Șeful de departament este Admin 2."}</p>
+  const menu = dept ? deptActions(dept) : "";
+  const actions = `${del}${cfg}${canEdit ? `<button class="btn btn-primary" type="button" data-act="save-dept">Salvează</button>` : ""}${menu}`;
+  return topHtml(title, isAdmin2() ? "Departamentul meu" : "Departamente", actions) + `<div class="content">
+    <p class="lead">${canFields ? "Ca Admin 2 puteți adăuga sau șterge câmpuri din interfața departamentului, fără a atinge restul spitalului. Deschideți meniul ☰ → Admin." : isDeptUser() ? "Cont de user: vedeți și completați datele departamentului. Structura câmpurilor o schimbă doar Admin 2." : "Departamentele administrative: structură de câmpuri + import Excel/CSV. Șeful de departament este Admin 2. Meniul ☰ → Admin."}</p>
     <div class="card" style="margin-bottom:12px"><div class="card-body"><div class="fields">
       <div><label class="lbl" for="dp-name">Denumire</label><input id="dp-name" type="text" value="${esc(dept ? dept.name : "")}"${lock}></div>
       <div><label class="lbl" for="dp-chief">Șef departament (Admin 2)</label><input id="dp-chief" type="text" value="${esc(dept ? dept.chief : "")}"${lock}></div>
@@ -2616,9 +3109,59 @@ function pageDeptForm(dept) {
     ${dept ? `<div class="card"><div class="card-head"><h2>Acces pe departament</h2><span class="sub">Admin 2 + useri</span></div><div class="card-body">
       <p style="margin:0 0 8px"><span class="role-badge admin2">Admin 2</span> ${esc(admin2?.name || dept.chief || "—")} <span class="muted">· poate configura câmpurile</span></p>
       <p style="margin:0 0 8px"><span class="role-badge user">User</span> ${users.length ? users.map(u => esc(u.name)).join(", ") : "niciun user încă"}</p>
-      ${canFields ? `<div class="form-actions" style="justify-content:flex-start;margin-top:10px"><button class="btn" type="button" data-act="dept-config" data-id="${esc(dept.id)}">Deschide configurarea câmpurilor</button></div>` : ""}
+      ${canFields ? `<div class="form-actions" style="justify-content:flex-start;margin-top:10px"><button class="btn" type="button" data-act="dept-config" data-id="${esc(dept.id)}">Deschide configurarea câmpurilor</button>
+        <button class="btn btn-primary" type="button" data-act="dept-admin" data-id="${esc(dept.id)}">Admin departament</button></div>` : ""}
     </div></div>` : ""}
   </div>`;
+}
+function pageAuditLogsAdmin() {
+  const logs = ensureAuditLogs();
+  const scope = ui.logScope || "all";
+  const wardId = ui.logWardId || "";
+  const q = String(ui.logQuery || "").trim().toLowerCase();
+  const wardOpts = (state.wards || []).map(w => `<option value="${esc(w.id)}"${w.id === wardId ? " selected" : ""}>${esc(w.name)}</option>`).join("");
+  const filtered = logs.filter(row => {
+    if (scope === "ward" && row.scope !== "ward" && row.scope !== "patient") return false;
+    if (scope === "patient" && row.scope !== "patient") return false;
+    if (wardId && row.wardId !== wardId) return false;
+    if (!q) return true;
+    const hay = [row.who, row.action, row.detail, row.wardName, row.patientName, row.fileNo, row.role].join(" ").toLowerCase();
+    return hay.includes(q);
+  });
+  const rows = filtered.slice(0, 200).map(row => {
+    const where = row.scope === "patient"
+      ? `${esc(row.patientName || "Pacient")}${row.fileNo ? " · " + esc(row.fileNo) : ""}${row.wardName ? " · " + esc(row.wardName) : ""}`
+      : row.scope === "ward"
+        ? esc(row.wardName || "Secție")
+        : "Spital";
+    const role = row.role === "admin1" ? "Admin 1" : row.role === "admin2" ? "Admin 2" : row.role === "medic" ? "Medic" : "User";
+    return `<tr>
+      <td class="muted">${esc(fmt(row.at))}</td>
+      <td><b>${esc(row.who)}</b><div class="muted">${esc(role)}</div></td>
+      <td>${esc(row.action)}</td>
+      <td>${where}</td>
+      <td>${esc(row.detail || "—")}</td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="5" class="muted" style="padding:16px">Nicio înregistrare pe filtrul ales. Logurile apar când cineva adaugă, modifică sau scrie pe foaie / secție.</td></tr>`;
+  return `<div class="card" style="margin-bottom:12px"><div class="card-head"><h2>Jurnal spital</h2><span class="sub">${filtered.length} din ${logs.length}</span></div><div class="card-body">
+    <p class="lead" style="margin-top:0">Cine deschide, adaugă, modifică sau scrie — pe spital, pe secție sau pe pacient. Autorizarea QR de pe telefon rămâne vizuală; jurnalul corelează deja acțiunile.</p>
+    <div class="fields" style="margin-bottom:12px">
+      <div><label class="lbl" for="log-scope">Domeniu</label>
+        <select id="log-scope" data-act="log-scope">
+          <option value="all"${scope === "all" ? " selected" : ""}>Tot spitalul</option>
+          <option value="ward"${scope === "ward" ? " selected" : ""}>Pe secții</option>
+          <option value="patient"${scope === "patient" ? " selected" : ""}>Pe pacient</option>
+        </select>
+      </div>
+      <div><label class="lbl" for="log-ward">Secție</label>
+        <select id="log-ward" data-act="log-ward"><option value="">Toate</option>${wardOpts}</select>
+      </div>
+      <div class="span-2"><label class="lbl" for="log-q">Caută</label><input id="log-q" type="search" value="${esc(ui.logQuery || "")}" placeholder="medic, pacient, acțiune…" data-act="log-query"></div>
+    </div>
+    <div class="card-body tight" style="padding:0;border:1px solid var(--border);border-radius:12px;overflow:auto;max-height:520px">
+      <table><thead><tr><th>Moment</th><th>Cine</th><th>Acțiune</th><th>Unde</th><th>Detaliu</th></tr></thead><tbody>${rows}</tbody></table>
+    </div>
+  </div></div>`;
 }
 function pageNomenclatoareAdmin() {
   const id = ui.nomId || NOMENCLATOR_CATALOG[0].id;
@@ -2659,9 +3202,14 @@ function pageNomenclatoareAdmin() {
 function pageModuleConfig() {
   const key = ui.moduleKey || "dept:spiaam";
   const dept = (state.departments || []).find(d => d.id === ui.deptId) || (state.departments || []).find(d => ("dept:" + deptCode(d.name)) === key);
+  const wardCfg = key.startsWith("ward:") ? (state.wards || []).find(w => ("ward:" + w.id) === key || ("ward:" + deptCode(w.name)) === key) : null;
   if (dept && !canEditDeptFields(dept.id) && !isAdmin1()) {
     return topHtml("Configurare restricționată", key, `<button class="btn" type="button" data-act="home">Înapoi</button>`) +
       `<div class="content"><div class="card"><div class="card-body"><p class="muted">Doar Admin 1 sau Admin 2 al acestui departament pot schimba câmpurile.</p></div></div></div>`;
+  }
+  if (wardCfg && !canManageWard(wardCfg) && !isAdmin1()) {
+    return topHtml("Configurare restricționată", key, `<button class="btn" type="button" data-act="view" data-id="admin">Înapoi</button>`) +
+      `<div class="content"><div class="card"><div class="card-body"><p class="muted">Doar Admin 1 sau Admin 2 al acestei secții pot schimba câmpurile.</p></div></div></div>`;
   }
   const tab = ui.moduleTab || "structura";
   const tabs = [["structura", "Structură"], ["import", "Import"], ["validare", "Validare"]].map(([id, label]) =>
@@ -2722,7 +3270,9 @@ function pageModuleConfig() {
   }
   const back = ui.deptId
     ? `<button class="btn" type="button" data-act="dept" data-id="${esc(ui.deptId)}">Înapoi</button>`
-    : `<button class="btn" type="button" data-act="admin">Admin</button>`;
+    : (key.startsWith("ward:") && ui.wardId
+      ? `<button class="btn" type="button" data-act="view" data-id="admin">Înapoi la Admin secție</button>`
+      : `<button class="btn" type="button" data-act="admin">Admin</button>`);
   return topHtml("Configurare și import", key, back) +
     `<div class="content"><nav class="tabs" style="margin-bottom:12px">${tabs}</nav>${body}</div>`;
 }
@@ -2844,6 +3394,7 @@ function pageAdmin() {
   const tab = ui.adminTab || "ops";
   const tabs = [
     ["ops", "Operare"],
+    ["logs", "Loguri"],
     ["nomenclatoare", "Nomenclatoare"],
     ["appointments", "Programări"],
     ["integrations", "Integrări"],
@@ -2852,7 +3403,9 @@ function pageAdmin() {
     ["ai", "AI local"]
   ].map(([id, label]) => `<button type="button" class="tab${tab === id ? " on" : ""}" data-act="admin-tab" data-id="${id}">${label}</button>`).join("");
   let body = "";
-  if (tab === "nomenclatoare") {
+  if (tab === "logs") {
+    body = pageAuditLogsAdmin();
+  } else if (tab === "nomenclatoare") {
     body = pageNomenclatoareAdmin();
   } else if (tab === "appointments") {
     body = appointmentsHtml({ wardId: null, wardName: "Toate specialitățile", admin: true });
@@ -3421,7 +3974,7 @@ function render() {
   document.body.classList.toggle("clinic", ["ward", "patient", "letter", "admit", "protocol"].includes(ui.page));
   document.getElementById("sidebar").innerHTML = navHtml();
   const main = document.getElementById("main");
-  const pages = { home: pageHome, gest: pageGest, "gest-new": pageGestNew, setup: pageSetup, people: pagePeople, dept: pageDept, "module-config": pageModuleConfig, ward: pageWard, patient: pagePatient, protocol: pageProtocol, letter: pageLetter, admit: pageAdmit, discharges: pageDischarges, "new-ward": pageNewWard, "ai-zena": pageAiZena, admin: pageAdmin };
+  const pages = { home: pageHome, gest: pageGest, "gest-new": pageGestNew, setup: pageSetup, people: pagePeople, hr: pageHrDashboard, dept: pageDept, "module-config": pageModuleConfig, ward: pageWard, patient: pagePatient, protocol: pageProtocol, letter: pageLetter, admit: pageAdmit, discharges: pageDischarges, "new-ward": pageNewWard, "ai-zena": pageAiZena, admin: pageAdmin };
   main.innerHTML = (pages[ui.page] || pageHome)();
   document.title = "ZenAIos — " + (document.querySelector("h1")?.textContent || "Spital");
   paintZena();
@@ -3520,6 +4073,7 @@ function commitDischarge() {
     w.discharged.unshift(p);
     ui.draft = null;
     ui.tab = "scrisoare";
+    auditLog({ action: "Externare", detail: `${p.last} ${p.first} · ${fields.dx}`, scope: "patient", wardId: w.id, patientId: p.id, patientName: `${p.last} ${p.first}`, fileNo: p.fileNo || "" });
     persist();
     toast("Externare salvată în baza clinică. Patul " + pad(bed) + " este liber.");
     go({ page: "letter" }, true);
@@ -3596,6 +4150,7 @@ function saveChart() {
   if (cm) p.heightCm = cm;
   p.consentAdmit = !!document.getElementById("ch-ca")?.checked;
   p.consentProc = !!document.getElementById("ch-cp")?.checked;
+  auditLog({ action: "Modificare foaie", detail: "Diagnostic / antecedente / acorduri", scope: "patient", patientId: p.id });
   persist();
   toast(p.dxCode ? "Foaia a fost actualizată." : "Foaia a fost actualizată. Diagnosticul de lucru nu începe cu un cod ICD.");
   go({ tab: "sumar" });
@@ -3671,6 +4226,7 @@ function saveAdmit() {
     w.staff = w.staff || [];
     w.staff.push({ id: uid(), name: physician, role: "medic" });
   }
+  auditLog({ action: "Internare", detail: `${last} ${first} · pat ${pad(bed)} · ${dx}`, scope: "patient", wardId: w.id, patientId: p.id, patientName: `${last} ${first}` });
   persist();
   ui.admitDraft = null;
   ui.admitStep = 0;
@@ -3688,6 +4244,7 @@ function addVital() {
   if (!ta || !av || !temp || !spo2 || !rr) { toast("Completați tensiunea, alura, respirația, temperatura și SpO₂.", "err"); return; }
   const row = { at: nowStamp(), ta, av, temp, spo2, rr, note: val("v-note") };
   p.vitals.push(row);
+  auditLog({ action: "Constante", detail: `TA ${ta} · AV ${av} · FR ${rr} · T ${temp} · SpO₂ ${spo2}`, scope: "patient", patientId: p.id });
   persist();
   void (async () => {
     if (live && w?.apiId) {
@@ -3712,6 +4269,7 @@ function orderStudy() {
   const title = val("st-title") || preset;
   const study = { id: uid(), kind, title, at: nowStamp(), status: "in-lucru", result: "", rows: [] };
   p.studies.unshift(study);
+  auditLog({ action: "Investigație", detail: `${kind}: ${title}`, scope: "patient", patientId: p.id });
   persist();
   void (async () => {
     if (live && w?.apiId) {
@@ -3785,10 +4343,87 @@ function addPerson() {
   spec.cols.forEach(([key]) => { fields[key] = val("pf-" + key); });
   if (!fields.last || !fields.first) { toast("Completați numele și prenumele.", "err"); return; }
   state.people = state.people || [];
-  state.people.push({ id: uid(), cat: ui.staffCat, fields });
+  const person = { id: uid(), cat: ui.staffCat, fields };
+  person.hr = buildHrDossier(person, state.people.length);
+  state.people.push(person);
   persist();
   toast("Fișa a fost adăugată în registru.");
   go({ page: "people", staffCat: ui.staffCat });
+}
+function openHrDemoPdf(personId, docId) {
+  const p = (state.people || []).find(x => x.id === personId);
+  if (!p) return;
+  const doc = (p.hr?.docs || []).find(d => d.id === docId);
+  if (!doc) return;
+  const hosp = state.hospital?.name || "Spital";
+  const html = `<!doctype html><html lang="ro"><head><meta charset="utf-8"><title>${esc(doc.title)}</title>
+    <style>body{font-family:Georgia,serif;max-width:720px;margin:40px auto;color:#111;padding:0 24px}
+    h1{font-size:22px;margin:0 0 8px} .meta{color:#555;font-size:13px;margin-bottom:24px}
+    .box{border:1px solid #ccc;padding:18px;border-radius:8px;min-height:280px}
+    .foot{margin-top:28px;font-size:12px;color:#666} @media print{body{margin:16px}}</style></head><body>
+    <h1>${esc(doc.title)}</h1>
+    <div class="meta">${esc(hosp)} · Dosar ${esc(employeeName(p))} · ${esc(doc.fileName)} · DEMO PDF</div>
+    <div class="box">
+      <p>Document demonstrativ atașat la dosarul angajatului <b>${esc(employeeName(p))}</b>.</p>
+      <p>Tip: ${esc(doc.kind)} · Emis: ${esc(fmtDay(doc.issuedAt))}${doc.expiresAt ? " · Expiră: " + esc(fmtDay(doc.expiresAt)) : ""}.</p>
+      <p>În producție aici apare scan-ul / PDF-ul real (contract CIM, fișă de post, instruire SSM, CI, diplomă etc.), sincronizat cu REVISAL.</p>
+    </div>
+    <div class="foot">ZenAIos HR · document demo · puteți tipări / Salvare ca PDF din browser.</div>
+    <script>setTimeout(()=>window.print(),400)</script>
+    </body></html>`;
+  const w = window.open("", "_blank", "noopener,noreferrer,width=820,height=900");
+  if (w) { w.document.write(html); w.document.close(); }
+  else toast("Permiteți ferestre pop-up pentru PDF demo.", "err");
+}
+function openHrCertificate(personId, certId) {
+  const p = (state.people || []).find(x => x.id === personId);
+  const cert = (p?.hr?.certificates || []).find(c => c.id === certId);
+  if (!p || !cert) return;
+  const w = window.open("", "_blank", "noopener,noreferrer,width=820,height=900");
+  if (w) { w.document.write(cert.html); w.document.close(); }
+}
+function emitHrAdeverinta(personId, kind) {
+  const p = (state.people || []).find(x => x.id === personId);
+  if (!p || !canManageHr()) return;
+  ensurePeopleHr();
+  const hr = p.hr;
+  const hosp = state.hospital?.name || "Spital demonstrație";
+  const number = `ADV-${todayKey().replace(/-/g, "")}-${String((hr.certificates || []).length + 1).padStart(3, "0")}`;
+  const titles = {
+    vechime: "Adeverință de vechime în muncă",
+    angajat: "Adeverință de angajat",
+    venit: "Adeverință de venit (demo)"
+  };
+  const title = titles[kind] || titles.vechime;
+  const bodyText = kind === "venit"
+    ? `Se adeverește că ${employeeName(p)}, încadrat(ă) ca ${personRole(p)} în cadrul ${hr.dept || personDept(p)}, realizează venituri salariale conform CIM ${hr.contractNo} (date demo).`
+    : kind === "angajat"
+      ? `Se adeverește că ${employeeName(p)} este angajat(ă) al/a ${hosp}, departament/secție ${hr.dept || personDept(p)}, pe funcția ${personRole(p)}, de la ${fmtDay(hr.hiredAt)}, contract ${hr.contractType} nr. ${hr.contractNo}, înregistrat în REVISAL sub ${hr.revisalId}.`
+      : `Se adeverește că ${employeeName(p)} are vechime în muncă în cadrul ${hosp} de la ${fmtDay(hr.hiredAt)} până în prezent, pe funcția ${personRole(p)} (${hr.dept || personDept(p)}). Contract ${hr.contractNo} · COR ${hr.corCode} · REVISAL ${hr.revisalId}.`;
+  const html = `<!doctype html><html lang="ro"><head><meta charset="utf-8"><title>${esc(title)}</title>
+    <style>body{font-family:Georgia,serif;max-width:720px;margin:48px auto;line-height:1.5;color:#111;padding:0 28px}
+    h1{font-size:20px;text-align:center;text-transform:uppercase;letter-spacing:.04em}
+    .head{text-align:center;margin-bottom:28px;font-size:13px;color:#444}
+    .nr{margin:18px 0;font-size:13px} .sign{margin-top:48px;display:flex;justify-content:space-between;gap:24px}
+    .sign div{width:42%;text-align:center;font-size:13px} @media print{body{margin:20px}}</style></head><body>
+    <div class="head"><b>${esc(hosp)}</b><br>Resurse umane · interconectare REVISAL (demo)</div>
+    <h1>${esc(title)}</h1>
+    <div class="nr">Nr. ${esc(number)} / ${esc(fmtDay(todayKey()))}</div>
+    <p>${esc(bodyText)}</p>
+    <p>Document generat automat din dosarul angajatului. Valabil pentru uz administrativ / demo.</p>
+    <div class="sign"><div>Întocmit<br><b>${esc(currentAccount()?.name || ui.accountName || "RU")}</b></div><div>Conducere RU<br><b>________________</b></div></div>
+    <script>setTimeout(()=>window.print(),450)</script>
+    </body></html>`;
+  hr.certificates = hr.certificates || [];
+  hr.certificates.push({ id: uid(), kind, title, number, at: nowStamp(), html });
+  hr.docs = hr.docs || [];
+  hr.docs.unshift(hrDoc("adeverinta", title, todayKey(), "", `${number}.pdf`));
+  auditLog({ action: "Adeverință HR", detail: `${title} · ${employeeName(p)} · ${number}`, scope: "hospital" });
+  persist();
+  toast(title + " emisă.");
+  go({ page: "hr", hrPersonId: p.id });
+  const w = window.open("", "_blank", "noopener,noreferrer,width=820,height=900");
+  if (w) { w.document.write(html); w.document.close(); }
 }
 function deletePerson(id) {
   state.people = (state.people || []).filter(p => p.id !== id);
@@ -3854,16 +4489,22 @@ function giveMed(id, forced) {
     return;
   }
   if (item.qty < qty) { toast("Stoc insuficient în magazie: " + item.qty + " " + item.unit + ".", "err"); return; }
-  item.qty -= qty;
-  p.meds = p.meds || [];
   const nurse = (w.staff || []).find(s => s.role === "asistenta");
   const route = val("med-route") || routeFor(item.name, item.dose) || "";
   const schedule = val("med-rhythm") || rhythmFor(item.name) || "";
   if (!item.dose) { toast("Medicația trebuie să aibă doză. Completați doza în magazie înainte de prescriere.", "err"); return; }
   if (!route) { toast("Alegeți calea de administrare. Softul nu o presupune „Oral”.", "err"); return; }
+  const deducted = correlateGestDischarge({
+    kind: "medicamente", medId: item.id, name: item.name, qty, unit: item.unit,
+    wardId: w.id, patientId: p.id, patientName: `${p.last} ${p.first}`,
+    source: "foaie", reason: "Prescriere pe foaie"
+  });
+  if (!deducted.ok) { toast(deducted.reason, "err"); return; }
+  p.meds = p.meds || [];
   const medRow = { id: uid(), name: item.name, dose: item.dose, group: item.group, qty, unit: item.unit, route, schedule, by: ui.accountName || (nurse && nurse.name) || p.physician || "", at: nowStamp() };
   p.meds.push(medRow);
   ui.holdMed = null;
+  auditLog({ action: "Medicație", detail: `${item.name} ${item.dose} · ${route}`, scope: "patient", patientId: p.id });
   persist();
   void (async () => {
     if (live && w.apiId) {
@@ -3930,11 +4571,16 @@ function addSupply(nameFromBtn) {
   const qty = Number(val("sup-qty")) || 1;
   const item = (w.stock || []).find(s => s.name === name);
   if (!item || !qty) { toast("Alegeți materialul și cantitatea.", "err"); return; }
-  if (item.qty < qty) { toast("Stoc insuficient: " + item.qty + " " + item.unit + ".", "err"); return; }
-  item.qty -= qty;
+  const deducted = correlateGestDischarge({
+    kind: "materiale", name: item.name, qty, unit: item.unit,
+    wardId: w.id, patientId: p.id, patientName: `${p.last} ${p.first}`,
+    source: "foaie", reason: "Consum pe foaie"
+  });
+  if (!deducted.ok) { toast(deducted.reason, "err"); return; }
   p.supplies.push({ id: uid(), name, qty, unit: item.unit, group: item.group || supplyClass(name), at: nowStamp(), source: "manual" });
+  auditLog({ action: "Consumabil", detail: `${name} × ${qty}`, scope: "patient", patientId: p.id });
   persist();
-  toast(name + " a fost descărcat din stocul secției.");
+  toast(name + " a fost descărcat din gestiune / stocul secției.");
   go({ tab: "consum", compose: true });
 }
 async function addNote() {
@@ -3958,6 +4604,7 @@ async function addNote() {
     toast("Evoluția a fost adăugată în foaie.");
   }
   p.notes.push(localNote);
+  auditLog({ action: "Evoluție", detail: text.slice(0, 120), scope: "patient", patientId: p.id });
   persist();
   go({ tab: "evolutie" });
 }
@@ -3967,6 +4614,7 @@ function saveDuty() {
   ["medic", "asistenta", "infirmiera", "brancardier"].forEach(role => { duty[role] = val("duty-" + role); });
   if (!duty.medic) { toast("Alegeți medicul de gardă.", "err"); return; }
   w.duty = duty;
+  auditLog({ action: "Gardă", detail: `Medic ${duty.medic}`, scope: "ward", wardId: w.id });
   persist();
   toast("Garda de azi a fost salvată.");
   go({ view: "garda" });
@@ -4021,13 +4669,42 @@ function applyKit() {
   pts.forEach(p => {
     KIT.forEach(([name, qty]) => {
       const item = w.stock.find(s => s.name === name);
-      item.qty -= qty;
+      const deducted = correlateGestDischarge({
+        kind: "materiale", name, qty, unit: item.unit,
+        wardId: w.id, patientId: p.id, patientName: `${p.last} ${p.first}`,
+        source: "kit", reason: "Kit tură"
+      });
+      if (!deducted.ok) return;
       p.supplies.push({ id: uid(), name, qty, unit: item.unit, at: nowStamp(), source: "tura" });
     });
   });
   persist();
-  toast("Kitul de tură a fost descărcat pe " + pts.length + " pacienți.");
-  go({ view: "materiale" });
+  toast("Kitul de tură a fost descărcat pe " + pts.length + " pacienți (gestiune actualizată).");
+  go({ view: "magazie" });
+}
+function wardGestOut() {
+  const w = ward();
+  if (!w || !canManageWard(w)) { toast("Doar Admin 2 pe această secție poate descărca direct.", "err"); return; }
+  const gestId = val("wg-gest") || ui.wardGestId || "materiale";
+  const itemKey = val("wg-item");
+  const qty = Number(val("wg-qty")) || 1;
+  const reason = val("wg-reason") || "Descărcare Admin 2 fără foaie";
+  if (!itemKey) { toast("Alegeți articolul.", "err"); return; }
+  const result = correlateGestDischarge({
+    kind: gestId,
+    name: itemKey,
+    medId: gestId === "medicamente" ? itemKey : undefined,
+    qty,
+    wardId: w.id,
+    source: "admin2",
+    reason
+  });
+  if (!result.ok) { toast(result.reason, "err"); return; }
+  ui.wardGestId = gestId;
+  ui.wardGestItemId = itemKey;
+  persist();
+  toast(`${result.item.name} (−${qty}) descărcat în gestiune.`);
+  go({ page: "ward", view: "admin", wardMenuOpen: false });
 }
 function saveWard() {
   const name = val("nw-name"), chief = val("nw-chief");
@@ -4097,14 +4774,67 @@ document.body.addEventListener("click", e => {
   if (act === "setup") go({ page: "setup", gest: "paturi" }, true);
   if (act === "gest-new") go({ page: "gest-new" }, true);
   if (act === "people") go({ page: "people", staffCat: el.dataset.id || "medici" }, true);
-  if (act === "dept") go({ page: "dept", deptId: el.dataset.id }, true);
+  if (act === "hr") go({ page: "hr", hrPersonId: "", hrDept: ui.hrDept || "" }, true);
+  if (act === "hr-filter-dept") go({ page: "hr", hrDept: el.dataset.id || "", hrPersonId: ui.hrPersonId || "" });
+  if (act === "hr-toggle-dept") {
+    const id = el.dataset.id || "";
+    const map = { ...(ui.hrExpanded || {}) };
+    const openNow = map[id] !== false;
+    map[id] = !openNow;
+    go({ page: "hr", hrExpanded: map });
+  }
+  if (act === "hr-dosar") go({ page: "hr", hrPersonId: el.dataset.id || el.dataset.pid || "" }, true);
+  if (act === "hr-dosar-close") go({ page: "hr", hrPersonId: "" });
+  if (act === "hr-open-doc") openHrDemoPdf(el.dataset.pid, el.dataset.did);
+  if (act === "hr-open-cert") openHrCertificate(el.dataset.pid, el.dataset.cid);
+  if (act === "hr-adeverinta") emitHrAdeverinta(el.dataset.id, el.dataset.kind || "vechime");
+  if (act === "dept") go({ page: "dept", deptId: el.dataset.id, deptMenuOpen: false }, true);
   if (act === "dept-new") go({ page: "dept", deptId: null }, true);
+  if (act === "dept-menu") go({ deptMenuOpen: !ui.deptMenuOpen });
+  if (act === "dept-admin") {
+    const dept = state.departments.find(d => d.id === (el.dataset.id || ui.deptId));
+    if (dept && canEditDeptFields(dept.id)) {
+      const code = deptCode(dept.name);
+      ensureModuleConfig("dept:" + code, dept.name);
+      go({ page: "module-config", moduleKey: "dept:" + code, moduleTab: "structura", deptId: dept.id, deptMenuOpen: false }, true);
+    } else {
+      go({ page: "dept", deptId: dept?.id || ui.deptId, deptMenuOpen: false }, true);
+    }
+  }
+  if (act === "dept-import") {
+    const dept = state.departments.find(d => d.id === (el.dataset.id || ui.deptId));
+    const code = dept ? deptCode(dept.name) : "spiaam";
+    ensureModuleConfig("dept:" + code, dept?.name || code);
+    go({ page: "module-config", moduleKey: "dept:" + code, moduleTab: "import", deptId: dept?.id || ui.deptId, deptMenuOpen: false }, true);
+  }
   if (act === "dept-config") {
     const dept = state.departments.find(d => d.id === (el.dataset.id || ui.deptId));
     const code = dept ? deptCode(dept.name) : "spiaam";
     ensureModuleConfig("dept:" + code, dept?.name || code);
-    go({ page: "module-config", moduleKey: "dept:" + code, moduleTab: "structura", deptId: dept?.id || ui.deptId }, true);
+    go({ page: "module-config", moduleKey: "dept:" + code, moduleTab: "structura", deptId: dept?.id || ui.deptId, deptMenuOpen: false }, true);
   }
+  if (act === "ward-config") {
+    const w = state.wards.find(x => x.id === (el.dataset.id || ui.wardId)) || ward();
+    if (!w) return;
+    const key = "ward:" + (w.id || deptCode(w.name));
+    ensureModuleConfig(key, w.name);
+    go({ page: "module-config", moduleKey: key, moduleTab: "structura", wardId: w.id, deptId: null, wardMenuOpen: false }, true);
+  }
+  if (act === "ward-admin-save") {
+    const w = ward();
+    if (!w || !canManageWard(w)) { toast("Nu aveți drept de Admin pe această secție.", "err"); return; }
+    w.chief = val("wa-chief");
+    w.nurse = val("wa-nurse");
+    if (w.chief && !(w.physicians || []).includes(w.chief)) {
+      w.physicians = w.physicians || [];
+      w.physicians.unshift(w.chief);
+    }
+    auditLog({ action: "Admin secție", detail: `Șef ${w.chief || "—"} · Asistent ${w.nurse || "—"}`, scope: "ward", wardId: w.id });
+    persist();
+    toast("Datele secției au fost salvate.");
+    go({ page: "ward", view: "admin", wardMenuOpen: false });
+  }
+  if (act === "ward-gest-out") wardGestOut();
   if (act === "module-tab") go({ moduleTab: el.dataset.id });
   if (act === "module-preset") {
     const key = ui.moduleKey || "dept:spiaam";
@@ -4165,6 +4895,21 @@ document.body.addEventListener("click", e => {
   if (act === "protocol") go({ page: "protocol", wardId: el.dataset.id || ui.wardId, patientId: el.dataset.pid }, true);
   if (act === "bed") go({ page: "admit", bed: Number(el.dataset.bed), admitStep: 0, admitDraft: null }, true);
   if (act === "tab") go({ tab: el.dataset.tab, compose: false, vitalExpand: null });
+  if (act === "sum-jump") {
+    const tab = el.dataset.tab || "sumar";
+    const compose = el.dataset.compose === "1";
+    const focus = el.dataset.focus || "";
+    go({ tab, compose, vitalExpand: null }, true);
+    if (focus) {
+      requestAnimationFrame(() => {
+        const node = document.getElementById(focus);
+        if (!node) return;
+        node.scrollIntoView({ behavior: "smooth", block: "start" });
+        const field = node.querySelector("input, textarea, select");
+        if (field) try { field.focus({ preventScroll: true }); } catch (_) { field.focus(); }
+      });
+    }
+  }
   if (act === "vital-card") {
     const id = el.dataset.id;
     const next = ui.vitalExpand === id ? null : id;
@@ -4182,8 +4927,9 @@ document.body.addEventListener("click", e => {
   if (act === "ward-menu") go({ wardMenuOpen: !ui.wardMenuOpen });
   if (act === "view") {
     const nextView = el.dataset.id === "saloane" && ui.view === "saloane" ? "paturi" : el.dataset.id;
-    go({ view: nextView, wardMenuOpen: false });
+    go({ view: nextView, wardMenuOpen: false, page: "ward" });
     if (nextView === "programari") void refreshAppointments(ward()?.apiId || null).then(() => go({ view: "programari" }));
+    if (nextView === "garzi" && ward()) void refreshWardPhysicians(ward());
   }
   if (act === "mag-class") { ui.magClass = el.dataset.id; go({ view: "magazie" }); }
   if (act === "med-class") { ui.medClass = el.dataset.id; ui.medQuery = ""; go({ tab: "medicatie", compose: true }); }
@@ -4597,6 +5343,13 @@ document.body.addEventListener("change", e => {
   if (act === "nom-import" && el.files?.[0]) importNomCsv(el.dataset.id, el.files[0]);
   if (act === "module-preview" && el.files?.[0]) previewModuleCsv(el.files[0]);
   if (act === "transfer-ward") go({ transferWardId: el.value, transferOpen: true });
+  if (act === "log-scope") go({ page: "admin", adminTab: "logs", logScope: el.value });
+  if (act === "log-ward") go({ page: "admin", adminTab: "logs", logWardId: el.value });
+  if (act === "ward-gest-type") {
+    ui.wardGestId = el.value;
+    ui.wardGestItemId = "";
+    go({ page: "ward", view: "admin" });
+  }
   if (act === "mod-field-label") {
     const key = ui.moduleKey || "dept:spiaam";
     ensureModuleConfig(key);
@@ -4607,6 +5360,13 @@ document.body.addEventListener("change", e => {
     }
   }
 });
+document.body.addEventListener("input", e => {
+  const el = e.target.closest("[data-act=\"log-query\"]");
+  if (!el) return;
+  ui.logQuery = el.value;
+  clearTimeout(el._logTimer);
+  el._logTimer = setTimeout(() => go({ page: "admin", adminTab: "logs", logQuery: el.value }), 220);
+});
 
 document.addEventListener("keydown", e => {
   if (e.key === "Enter" && e.target.id === "zena-q") { e.preventDefault(); zenaAsk(e.target.value); return; }
@@ -4614,6 +5374,7 @@ document.addEventListener("keydown", e => {
   if (e.key !== "Escape") return;
   if (ui.vitalExpand) { go({ vitalExpand: null }); return; }
   if (ui.wardMenuOpen) { go({ wardMenuOpen: false }); return; }
+  if (ui.deptMenuOpen) { go({ deptMenuOpen: false }); return; }
   if (ui.histOpen) { go({ histOpen: false, histDoc: "" }); return; }
   if (ui.zenaOpen) { go({ zenaOpen: false }); return; }
   if (ui.page === "letter" && ui.draft) go({ page: "patient", tab: "externare" }, true);
